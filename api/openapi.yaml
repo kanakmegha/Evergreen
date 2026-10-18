@@ -1,0 +1,536 @@
+openapi: 3.1.0
+info:
+  title: Everroot Discovery API
+  version: 0.1.0
+  description: Anonymous known-Nakshatra discovery and localhost-only review workflow.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        '200': { description: Process is alive }
+  /readyz:
+    get:
+      operationId: ready
+      responses:
+        '200': { description: Database is ready }
+        '503': { description: Database is unavailable }
+  /api/v1/traditions:
+    get:
+      operationId: listTraditions
+      responses:
+        '200':
+          description: Traditions available for public discovery
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Tradition' } }
+  /api/v1/traditions/{tradition}/regions:
+    get:
+      operationId: listTraditionRegions
+      parameters:
+        - in: path
+          name: tradition
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Active regions supported for this tradition; an empty list means no regional selector applies
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        '503': { description: Region catalog unavailable }
+  /api/v1/nakshatras:
+    get:
+      operationId: listNakshatras
+      responses:
+        '200':
+          description: Accepted known-Nakshatra inputs
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Nakshatra' } }
+  /api/v1/discoveries:
+    post:
+      operationId: discoverByNakshatra
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiscoveryRequest' }
+      responses:
+        '200':
+          description: Matching reviewed mappings, or explicit no-verified-mapping result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryResponse' }
+        '400': { description: Invalid request or unsupported Nakshatra/tradition }
+        '503': { description: Discovery store unavailable }
+  /api/v1/trees:
+    get:
+      operationId: listBotanicalReference
+      description: >
+        Exploratory botanical discovery (Track B). Returns authority-verified tree
+        identities from Everroot's botanical reference: accepted name, authorship,
+        rank, taxonomic status, family, genus, order and the protologue citation,
+        each with the GBIF Backbone taxon key it was matched to. These are botanical
+        records, never cultural associations. Deterministic ordering is stated in the
+        response so nothing reads as a ranking.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: Matches the accepted name, family, genus or a recorded common name.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 60 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: The botanical reference, filtered if a query was supplied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BotanicalReference' }
+        '400': { description: Invalid search term or paging values }
+        '503': { description: Botanical reference unavailable }
+  /api/v1/explain:
+    post:
+      operationId: explainBotanicalFacts
+      description: >
+        Generates an accessible explanation of botanical facts Everroot has already
+        retrieved. The provider is given only authority-verified fields, and never
+        the free text a person wrote about themselves. A provider failure is returned
+        as a structured provider state alongside the records, and is never reported as
+        missing cultural data. No generated text is stored or published as a cultural
+        claim.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExplainRequest' }
+      responses:
+        '200':
+          description: >
+            Sourced botanical records plus an explanation envelope. explanation.status
+            is "ok" or "unavailable"; when unavailable, explanation.reason distinguishes
+            not_configured, unauthorized, rate_limited, timeout, provider_error and
+            empty_response. The request still succeeds either way.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExplainResponse' }
+        '400': { description: Invalid intention, selection or request body }
+        '404': { description: No botanical record for the requested tree }
+        '503': { description: Botanical reference unavailable }
+  /internal/v1/review/queue:
+    get:
+      operationId: reviewQueue
+      description: Local development only; returns each mapping's newest revision with source evidence, reviewer state, publication state and botanical candidates.
+      responses:
+        '200':
+          description: Latest revisions with cultural and botanical evidence
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReviewQueueItem' } }
+        '403': { description: Admin authorization disabled or request is not loopback }
+  /internal/v1/sources:
+    post:
+      operationId: createSource
+      description: Local-only source registry entry; created unverified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceInput' }
+      responses:
+        '201':
+          description: Source created unverified
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, verificationStatus]
+                properties:
+                  id: { type: string, format: uuid }
+                  verificationStatus: { type: string, const: unverified }
+        '400': { description: Invalid bibliographic fields or rights }
+        '403': { description: Local review authorization denied }
+  /internal/v1/sources/{sourceId}/evidence:
+    post:
+      operationId: createEvidence
+      parameters:
+        - in: path
+          name: sourceId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvidenceInput' }
+      responses:
+        '201':
+          description: Evidence reference created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { type: string, format: uuid }
+        '400': { description: Invalid locator or passage text without reuse permission }
+        '403': { description: Local review authorization denied }
+        '404': { description: Source not found }
+  /internal/v1/sources/{sourceId}/review:
+    post:
+      operationId: reviewSource
+      parameters:
+        - in: path
+          name: sourceId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewRequest' }
+      responses:
+        '204': { description: Source review recorded }
+        '400': { description: Invalid decision }
+        '403': { description: Local review authorization denied }
+        '404': { description: Source not found }
+  /internal/v1/mappings:
+    post:
+      operationId: createMappingRevision
+      description: Creates an immutable first or next revision; mappingId may be supplied for a new version.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MappingInput' }
+      responses:
+        '201':
+          description: Immutable mapping revision created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mappingId, revisionId, version, botanicalCandidateIds]
+                properties:
+                  mappingId: { type: string, format: uuid }
+                  revisionId: { type: string, format: uuid }
+                  version: { type: integer, minimum: 1 }
+                  botanicalCandidateIds: { type: array, items: { type: string, format: uuid } }
+        '400': { description: Invalid tradition, region, Nakshatra or evidence }
+        '403': { description: Local review authorization denied }
+  /internal/v1/botanical-candidates/{candidateId}/review:
+    post:
+      operationId: reviewBotanicalCandidate
+      parameters:
+        - in: path
+          name: candidateId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewRequest' }
+      responses:
+        '204': { description: Botanical review recorded independently }
+        '400': { description: Invalid decision }
+        '403': { description: Botanical reviewer role required }
+        '404': { description: Candidate not found }
+  /internal/v1/review/{revisionId}:
+    post:
+      operationId: reviewRevision
+      parameters:
+        - in: path
+          name: revisionId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewRequest' }
+      responses:
+        '204': { description: Decision recorded for exact immutable revision }
+        '400': { description: Invalid decision }
+        '403': { description: Admin authorization denied }
+        '404': { description: Revision not found }
+  /internal/v1/publications/{revisionId}:
+    post:
+      operationId: publishRevision
+      parameters:
+        - in: path
+          name: revisionId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicationRequest' }
+      responses:
+        '204': { description: Publication action recorded for exact revision }
+        '400': { description: Invalid action or publication gate failed }
+        '403': { description: Admin authorization denied }
+        '404': { description: Revision not found }
+components:
+  schemas:
+    Tradition:
+      type: object
+      required: [slug, name]
+      properties:
+        slug: { type: string }
+        name: { type: string }
+    Nakshatra:
+      type: object
+      required: [name, ordinal]
+      properties:
+        name: { type: string }
+        ordinal: { type: integer, minimum: 1, maximum: 27 }
+    DiscoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [tradition, nakshatra]
+      properties:
+        tradition: { type: string, minLength: 1 }
+        region: { type: string }
+        nakshatra: { type: string, minLength: 1 }
+    DiscoveryResponse:
+      type: object
+      required: [status, recommendations]
+      properties:
+        status: { type: string, enum: [verified_results, no_verified_mapping] }
+        recommendations: { type: array, items: { $ref: '#/components/schemas/Recommendation' } }
+    Recommendation:
+      type: object
+      required: [mappingId, revisionId, version, tradition, nakshatra, claim, sources, botanicalCandidates]
+      properties:
+        mappingId: { type: string, format: uuid }
+        revisionId: { type: string, format: uuid }
+        version: { type: integer }
+        tradition: { type: string }
+        region: { type: string }
+        nakshatra: { type: string }
+        claim: { type: string }
+        interpretation: { type: string }
+        sources: { type: array, items: { $ref: '#/components/schemas/SourceEvidence' } }
+        botanicalCandidates: { type: array, items: { $ref: '#/components/schemas/BotanicalCandidate' } }
+    SourceEvidence:
+      type: object
+      required: [id, title, language, accessedOn, reuseStatus, locator, relationship]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        author: { type: string }
+        publisher: { type: string }
+        publicationDate: { type: [string, 'null'], format: date-time }
+        url: { type: string }
+        bibliographicReference: { type: string }
+        language: { type: string }
+        accessedOn: { type: string, format: date-time }
+        attributionRequirements: { type: string }
+        reuseStatus: { type: string, enum: [permitted, citation_only, restricted, unknown] }
+        locator: { type: string }
+        originalText: { type: [string, 'null'] }
+        translation: { type: [string, 'null'] }
+        translationRights: { type: string }
+        verificationStatus: { type: string, enum: [unverified, verified, rejected] }
+        relationship: { type: string }
+    BotanicalCandidate:
+      type: object
+      required: [candidateId, scientificName, certainty, confidence, reviewStatus, definitive, evidence]
+      properties:
+        candidateId: { type: string, format: uuid }
+        scientificName: { type: string }
+        certainty: { type: string, enum: [uncertain, probable, confirmed] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        reviewStatus: { type: string }
+        definitive: { type: boolean }
+        evidence: { type: array, items: { $ref: '#/components/schemas/SourceEvidence' } }
+    ReviewQueueItem:
+      type: object
+      required: [revisionId, mappingId, version, tradition, region, nakshatra, claim, interpretation, latestReview, publicationState, sources, botanicalCandidates]
+      properties:
+        revisionId: { type: string, format: uuid }
+        mappingId: { type: string, format: uuid }
+        version: { type: integer }
+        tradition: { type: string }
+        region: { type: string }
+        nakshatra: { type: string }
+        claim: { type: string }
+        interpretation: { type: string }
+        latestReview: { type: string }
+        publicationState: { type: string }
+        sources: { type: array, items: { $ref: '#/components/schemas/SourceEvidence' } }
+        botanicalCandidates: { type: array, items: { $ref: '#/components/schemas/BotanicalCandidate' } }
+    ReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [approved, changes_requested, rejected] }
+        notes: { type: string }
+    PublicationRequest:
+      type: object
+      additionalProperties: false
+      required: [action, reason]
+      properties:
+        action: { type: string, enum: [published, unpublished, withdrawn] }
+        reason: { type: string }
+    SourceInput:
+      type: object
+      additionalProperties: false
+      required: [title, sourceType, language, accessedOn, reuseStatus]
+      properties:
+        title: { type: string, minLength: 1 }
+        sourceType: { type: string }
+        author: { type: string }
+        publisher: { type: string }
+        publicationDate: { type: [string, 'null'], format: date }
+        url: { type: string }
+        bibliographicReference: { type: string }
+        language: { type: string, minLength: 1 }
+        accessedOn: { type: string, format: date }
+        attributionRequirements: { type: string }
+        reuseStatus: { type: string, enum: [permitted, citation_only, restricted, unknown] }
+    EvidenceInput:
+      type: object
+      additionalProperties: false
+      required: [locator, language]
+      properties:
+        locator: { type: string, minLength: 1 }
+        originalText: { type: [string, 'null'] }
+        language: { type: string, minLength: 1 }
+        translation: { type: [string, 'null'] }
+        translationRights: { type: string, enum: [permitted, citation_only, restricted, unknown, not_applicable] }
+        evidenceNotes: { type: string }
+    MappingInput:
+      type: object
+      additionalProperties: false
+      required: [tradition, nakshatra, claim, evidence]
+      properties:
+        mappingId: { type: [string, 'null'], format: uuid }
+        tradition: { type: string }
+        regionCode: { type: string }
+        nakshatra: { type: string }
+        claim: { type: string, minLength: 1 }
+        interpretation: { type: string }
+        evidence:
+          type: array
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: { type: string, format: uuid }
+              relationship: { type: string, enum: [supports, qualifies, contradicts, context] }
+        botanicalCandidates:
+          type: array
+          items:
+            type: object
+            required: [scientificName, certainty, confidence, evidence]
+            properties:
+              scientificName: { type: string }
+              certainty: { type: string, enum: [uncertain, probable, confirmed] }
+              confidence: { type: number, minimum: 0, maximum: 1 }
+              evidence: { type: array, items: { type: object } }
+    BotanicalReference:
+      type: object
+      required: [status, ordering, query, count, trees]
+      properties:
+        status: { type: string, enum: [ok] }
+        ordering:
+          type: string
+          description: Stated so a deterministic list is never mistaken for a ranking.
+        query: { type: string }
+        count: { type: integer, minimum: 0 }
+        trees: { type: array, items: { $ref: '#/components/schemas/TreeFact' } }
+    TreeFact:
+      type: object
+      description: >
+        One authority-verified botanical record. There is deliberately no field for a
+        cultural claim: culturalClaim is always "none", and cultural associations are
+        only ever served by POST /api/v1/discoveries.
+      required:
+        - speciesId
+        - acceptedName
+        - recordType
+        - culturalClaim
+        - authority
+      properties:
+        speciesId: { type: string, format: uuid }
+        acceptedName: { type: string }
+        authorship: { type: string }
+        family: { type: string }
+        genus: { type: string }
+        order: { type: string }
+        rank: { type: string }
+        taxonStatus: { type: string, enum: [ACCEPTED, SYNONYM, DOUBTFUL] }
+        protologue: { type: string }
+        commonNames:
+          type: array
+          items:
+            type: object
+            required: [name, language]
+            properties:
+              name: { type: string }
+              language: { type: string }
+        authority:
+          type: object
+          required: [dataset, taxonKey]
+          properties:
+            dataset: { type: string }
+            doi: { type: string }
+            url: { type: string }
+            taxonKey: { type: integer, format: int64 }
+        sources: { type: array, items: { $ref: '#/components/schemas/SourceEvidence' } }
+        recordType: { type: string, enum: [botanical_authority] }
+        culturalClaim: { type: string, enum: ['none'] }
+    ExplainRequest:
+      type: object
+      additionalProperties: false
+      required: [intention]
+      properties:
+        intention: { type: string, enum: [personal, remember, culture, future, explore] }
+        tradition: { type: string, maxLength: 100 }
+        nakshatra: { type: string, maxLength: 100 }
+        region: { type: string, maxLength: 100 }
+        speciesId: { type: string, maxLength: 64 }
+    EvidenceStatus:
+      type: object
+      description: >
+        Structured, so the interface can never turn a provider failure into a
+        missing-record message. Only "reviewed_match" may be presented as verified.
+      properties:
+        culturalAssociation: { type: string, enum: [reviewed_match, no_reviewed_match, not_queryable] }
+        botanicalIdentity: { type: string, enum: [authority_verified, unavailable] }
+        habitat: { type: string }
+        ecologicalRole: { type: string }
+        documentedStories: { type: string }
+        personalMeaning: { type: string }
+    ExplanationEnvelope:
+      type: object
+      required: [status, reason, text, model]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        reason:
+          type: string
+          enum: ['', not_configured, unauthorized, rate_limited, timeout, provider_error, empty_response]
+        text: { type: string }
+        model: { type: string }
+    ExplainResponse:
+      type: object
+      required: [status, task, evidence, trees, explanation]
+      properties:
+        status: { type: string, enum: [ok] }
+        task: { type: string, enum: [explore_selection, why_this_tree] }
+        evidence: { $ref: '#/components/schemas/EvidenceStatus' }
+        trees: { type: array, items: { $ref: '#/components/schemas/TreeFact' } }
+        explanation: { $ref: '#/components/schemas/ExplanationEnvelope' }

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" role="img" aria-label="Everroot">
+  <rect width="40" height="40" rx="9" fill="#f7f6ef" />
+  <g fill="none" stroke="#244f3d" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 33V18" />
+    <path d="M20 25c-6.6 0-10.4-3.8-10.4-9.4C16.2 15.6 20 18.4 20 25Z" />
+    <path d="M20 20.4c0-7.2 3.8-11.8 11.2-11.8 0 7.2-3.8 11.8-11.2 11.8Z" />
+    <path d="M10.5 33h19" />
+  </g>
+</svg>

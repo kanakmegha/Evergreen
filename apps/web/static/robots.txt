@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+
+# Results hold personal notes and are marked noindex.
+Disallow: /results/
+# Internal knowledge-review tooling.
+Disallow: /review
+
+Sitemap: https://everroot.org/sitemap.xml
