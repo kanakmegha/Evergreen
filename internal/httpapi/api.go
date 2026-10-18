@@ -15,6 +15,7 @@ import (
 
 	"everroot/internal/ai"
 	"everroot/internal/ai/conversation"
+	"everroot/internal/dbhealth"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -87,29 +88,56 @@ func (a *API) routes() {
 	a.mux.Handle("POST /internal/v1/publications/{revisionId}", a.admin(http.HandlerFunc(a.publication)))
 }
 
-// cors grants cross-origin access only when it is explicitly configured.
+// cors grants cross-origin access only to origins listed in WEB_ORIGIN.
 //
-// The web app calls this API on its own origin — Vite proxies /api during
-// development and vercel.json rewrites /api in production — so no grant is
-// needed by default. Reflecting an arbitrary Origin whenever WEB_ORIGIN is
-// unset would let any website proxy requests through this API, including the
-// paid model calls behind /api/v1/questions.
+// Cross-origin access is opt-in. When the web app and the API share an origin
+// (Vite proxies /api during development) nothing is granted and nothing is
+// needed. When they are on different origins, WEB_ORIGIN must name the web
+// app's origin exactly.
+//
+// The list is comma-separated so a production host and preview hosts can be
+// allowed together. A wildcard is deliberately not supported and an unset
+// WEB_ORIGIN grants nothing: this API spends a paid model call on
+// /api/v1/questions, so reflecting an arbitrary Origin would let any site spend
+// someone else's quota.
 func (a *API) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		allowed := strings.TrimSpace(os.Getenv("WEB_ORIGIN"))
-		if origin != "" && allowed != "" && (allowed == "*" || allowed == origin) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+
+		// Any response whose CORS headers depend on the request origin must say
+		// so, otherwise a shared cache can hand one origin's grant to another.
+		w.Header().Add("Vary", "Origin")
+
+		if _, ok := allowedOrigins()[origin]; ok && origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, Accept")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 		}
+
+		// Answer preflight whether or not the origin is allowed. An origin that
+		// is not allowed simply receives no grant, and the browser blocks the
+		// real request, which is the correct outcome.
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// allowedOrigins parses WEB_ORIGIN into a set of exact origins. Entries are
+// trimmed and any trailing slash is removed, because an origin has no path and
+// "https://example.com/" would otherwise never match a real Origin header.
+func allowedOrigins() map[string]struct{} {
+	set := map[string]struct{}{}
+	for _, part := range strings.Split(os.Getenv("WEB_ORIGIN"), ",") {
+		part = strings.TrimRight(strings.TrimSpace(part), "/")
+		if part != "" && part != "*" {
+			set[part] = struct{}{}
+		}
+	}
+	return set
 }
 func (a *API) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +155,14 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if err := a.db.Ping(ctx); err != nil {
+		// Report the classification, never the driver error: it can embed the
+		// host and user from the connection string.
+		diag := dbhealth.Classify(err)
+		a.log.Warn("readiness check failed",
+			"category", string(diag.Category),
+			"sqlstate", diag.SQLState,
+			"retryable", diag.Retryable,
+		)
 		writeError(w, 503, "database unavailable")
 		return
 	}
@@ -160,17 +196,42 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
-	fallback := []map[string]string{
-		{"slug": "nakshatra-tree-association", "name": "Nakshatra Tree Association"},
+// reviewedCatalogueUnavailable reports a request for reviewed catalogue data
+// that cannot be served.
+//
+// These endpoints describe Everroot's reviewed records, so an unreachable
+// database is reported as unavailable rather than answered from a built-in
+// list. A hardcoded reply would be indistinguishable from the reviewed record
+// and would imply Everroot had checked something it had not.
+func (a *API) reviewedCatalogueUnavailable(w http.ResponseWriter, r *http.Request, err error) {
+	diag := dbhealth.Diagnosis{
+		Category:    dbhealth.CategoryNotConfigured,
+		Retryable:   false,
+		Remediation: "Set DATABASE_URL on the backend project; the reviewed catalogue is served from PostgreSQL.",
 	}
+	if !errors.Is(err, errDatabaseNotConfigured) {
+		diag = dbhealth.Classify(err)
+	}
+	a.log.Warn("reviewed catalogue unavailable",
+		"path", r.URL.Path,
+		"category", string(diag.Category),
+		"sqlstate", diag.SQLState,
+		"retryable", diag.Retryable,
+	)
+	writeError(w, 503, "the reviewed catalogue is unavailable right now; please try again shortly")
+}
+
+// errDatabaseNotConfigured is the reason logged when no pool exists at all.
+var errDatabaseNotConfigured = errors.New("DATABASE_URL is not configured")
+
+func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
 	if a.db == nil {
-		writeJSON(w, 200, fallback)
+		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
 		return
 	}
 	rows, err := a.db.Query(r.Context(), `SELECT t.slug,t.display_name FROM traditions t JOIN cultures c ON c.id=t.culture_id WHERE t.status='active' AND c.status='active' ORDER BY t.display_name`)
 	if err != nil {
-		writeJSON(w, 200, fallback)
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -178,25 +239,25 @@ func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var slug, name string
 		if err := rows.Scan(&slug, &name); err != nil {
-			writeError(w, 500, "catalog read failed")
+			a.reviewedCatalogueUnavailable(w, r, err)
 			return
 		}
 		out = append(out, map[string]string{"slug": slug, "name": name})
 	}
-	if rows.Err() != nil {
-		writeJSON(w, 200, fallback)
+	if err := rows.Err(); err != nil {
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	writeJSON(w, 200, out)
 }
 func (a *API) regions(w http.ResponseWriter, r *http.Request) {
 	if a.db == nil {
-		writeJSON(w, 200, []string{})
+		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
 		return
 	}
 	rows, err := a.db.Query(r.Context(), `SELECT tl.region_name FROM tradition_locales tl JOIN traditions t ON t.id=tl.tradition_id JOIN cultures c ON c.id=t.culture_id WHERE t.slug=$1 AND t.status='active' AND c.status='active' AND tl.status='active' ORDER BY tl.region_name`, r.PathValue("tradition"))
 	if err != nil {
-		writeJSON(w, 200, []string{})
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -204,38 +265,26 @@ func (a *API) regions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var region string
 		if err := rows.Scan(&region); err != nil {
-			writeError(w, 500, "region catalog read failed")
+			a.reviewedCatalogueUnavailable(w, r, err)
 			return
 		}
 		regions = append(regions, region)
 	}
-	if rows.Err() != nil {
-		writeJSON(w, 200, []string{})
+	if err := rows.Err(); err != nil {
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	writeJSON(w, 200, regions)
 }
 
-var canonicalNakshatras = []string{
-	"Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
-	"Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
-	"Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
-	"Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta",
-	"Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
-}
-
 func (a *API) nakshatras(w http.ResponseWriter, r *http.Request) {
-	fallback := make([]map[string]any, len(canonicalNakshatras))
-	for i, name := range canonicalNakshatras {
-		fallback[i] = map[string]any{"name": name, "ordinal": i + 1}
-	}
 	if a.db == nil {
-		writeJSON(w, 200, fallback)
+		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
 		return
 	}
 	rows, err := a.db.Query(r.Context(), `SELECT canonical_name,ordinal FROM nakshatras ORDER BY ordinal`)
 	if err != nil {
-		writeJSON(w, 200, fallback)
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -244,13 +293,13 @@ func (a *API) nakshatras(w http.ResponseWriter, r *http.Request) {
 		var name string
 		var ordinal int
 		if err := rows.Scan(&name, &ordinal); err != nil {
-			writeError(w, 500, "catalog read failed")
+			a.reviewedCatalogueUnavailable(w, r, err)
 			return
 		}
 		out = append(out, map[string]any{"name": name, "ordinal": ordinal})
 	}
-	if rows.Err() != nil {
-		writeJSON(w, 200, fallback)
+	if err := rows.Err(); err != nil {
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	writeJSON(w, 200, out)

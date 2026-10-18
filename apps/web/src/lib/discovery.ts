@@ -211,14 +211,28 @@ export interface Nakshatra {
 export const NAKSHATRA_TRADITION = 'nakshatra-tree-association';
 
 /**
- * apiURL resolves a path against PUBLIC_API_URL if configured in production,
- * or falls back to a same-origin relative path.
+ * joinAPIBase is the pure part of apiURL, split out so the joining rules can be
+ * tested without a bundler. An empty base means "same origin".
+ */
+export function joinAPIBase(base: string, path: string): string {
+  const origin = String(base ?? '').trim().replace(/\/+$/, '');
+  const suffix = path.startsWith('/') ? path : `/${path}`;
+  return `${origin}${suffix}`;
+}
+
+/**
+ * apiURL is the single helper every API call goes through.
+ *
+ * PUBLIC_API_URL is inlined at build time. It is only needed when the API is
+ * served from a different origin than the web app; when it is unset, requests
+ * stay relative and are proxied by the development server or the platform.
+ * Setting it requires WEB_ORIGIN on the API to name this app's origin, because
+ * a cross-origin call is refused without it.
  */
 export function apiURL(path: string): string {
-  const base = typeof import.meta !== 'undefined' && (import.meta as any).env?.PUBLIC_API_URL
-    ? String((import.meta as any).env.PUBLIC_API_URL).replace(/\/+$/, '')
-    : '';
-  return `${base}${path}`;
+  const env = typeof import.meta !== 'undefined' ? (import.meta as any).env : undefined;
+  const configured = env?.PUBLIC_API_URL;
+  return joinAPIBase(configured ? String(configured) : '', path);
 }
 
 async function getJSON<T>(url: string): Promise<T> {

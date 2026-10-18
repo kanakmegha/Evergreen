@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "esbuild test/treeOption.test.ts --bundle --platform=node --format=esm --outfile=.tmp-test/treeOption.test.mjs && node --test .tmp-test/treeOption.test.mjs; status=$?; rm -rf .tmp-test; exit $status",
+    "test": "esbuild test/treeOption.test.ts test/apiURL.test.ts --bundle --platform=node --format=esm --outdir=.tmp-test && node --test .tmp-test/*.test.js; status=$?; rm -rf .tmp-test; exit $status",
     "test:ui": "node test/ui.mjs"
   },
   "devDependencies": {

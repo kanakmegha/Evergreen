@@ -143,33 +143,101 @@ Feedback is posted to `POST /api/v1/feedback` and is independent of answer gener
 
 ## Deploying
 
-Three values must be supplied by the deployment. Nothing in the repository invents a production host or a secret.
+The project deploys as two Vercel projects from this one repository:
 
-| Variable | Required | Purpose |
+| Project | Root directory | What it runs |
 | --- | --- | --- |
-| `DATABASE_URL` | For persistence only | PostgreSQL connection for interactions and feedback. The API starts, and answers questions, without it. |
-| `HF_TOKEN` | To answer questions | Hugging Face credentials. Never commit it, and never expose it to the browser. |
-| `PUBLIC_SITE_URL` | Before launch | The public origin, for example `https://example.org`. Used for canonical links, `robots.txt` and `sitemap.xml`. |
+| Backend | repository root | the Go API, as a Vercel **Service** (`framework: "go"`) running the long-running server in `cmd/api` |
+| Frontend | `apps/web` | the SvelteKit web app |
 
-### The production domain is not set anywhere
+The backend is a listening HTTP server, not a serverless function. It reads the port to bind from `PORT`, which the platform assigns and then probes; if nothing listens there in time the deployment is declared failed. `API_ADDR` is a local-development convenience and is ignored whenever `PORT` is set. The server binds its listener before it touches the database, so a slow or unreachable PostgreSQL can never stop it from starting.
 
-`PUBLIC_SITE_URL` is the only place a public origin is configured. When it is unset, canonical links, `robots.txt` and `sitemap.xml` are generated from the origin each request arrived on, so they always match the domain actually serving the site — a platform subdomain, a preview URL, or a real domain. Set it when the canonical origin must differ from the serving host, for example so a platform subdomain is not indexed as the canonical address.
+### Environment variables
 
-### Static asset still required
+| Variable | Project | Required | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | Backend | Yes, for the reviewed catalogue | PostgreSQL connection (Neon: use the **pooled** endpoint with `sslmode=require`). The nakshatra, tradition, region and tree catalogue and interaction persistence all read it. **The AI answer path does not**: `/api/v1/questions` answers from the model alone. |
+| `DIRECT_URL` | — | No | The **direct** (unpooled) endpoint. Used only by `cmd/migrate`, never by the server, because the migration runner holds a session-level advisory lock. |
+| `DATABASE_CONNECT_TIMEOUT` | Backend | No | Bound on one connection attempt (default `10s`). Raise it if Neon cold starts exceed the default. |
+| `HF_TOKEN` | Backend | To answer questions | Hugging Face credentials. Never commit it, and never expose it to the browser. |
+| `HF_MODEL_ID`, `HF_BASE_URL` | Backend | No | Optional provider overrides. |
+| `WEB_ORIGIN` | Backend | Only for a split origin | Comma-separated list of web origins allowed to call this API. See below. |
+| `PUBLIC_API_URL` | Frontend | Only for a split origin | The backend origin, for example `https://everroot-api.example`. Must be set at **build** time. |
+| `PUBLIC_SITE_URL` | Frontend | Before launch | The public origin used for canonical links, `robots.txt` and `sitemap.xml`. |
+| `API_ADDR` | — | No | Local development only. Do not set it on a platform that provides `PORT`. |
 
-`apps/web/src/lib/site.ts` references `/og-hero.png` for social previews. That image is not in the repository yet; add a 1200×630 image at `apps/web/static/og-hero.png`.
+### If the reviewed catalogue returns 503
 
-### Health and readiness
+`/api/v1/nakshatras`, `/api/v1/traditions`, `/api/v1/traditions/{tradition}/regions` and `/api/v1/trees` describe records a person checked, so when the database cannot be reached they report **503 `the reviewed catalogue is unavailable right now`**. They deliberately do not answer from a built-in list: a hardcoded reply is indistinguishable from a reviewed record and would imply Everroot had checked something it had not.
 
-`/healthz` reports that the process is up and does not touch the database. `/readyz` reports database readiness and returns 503 when PostgreSQL is unreachable, so a platform health check can tell "the API is running" apart from "persistence is available".
+A 503 is a database problem, not a code problem, but "the database" covers several failures that need different fixes. Each failure is logged with a `category` and, when PostgreSQL itself answered, a `sqlstate`. The driver's own error string is never logged: for a connection failure it embeds the host and user from `DATABASE_URL`.
 
-### Cross-origin access
+| `category` | Meaning | Fix |
+| --- | --- | --- |
+| `not_configured` | `DATABASE_URL` is unset | Set it on the backend project |
+| `malformed_dsn` | The connection string cannot be parsed | Re-copy it from the Neon dashboard |
+| `dns` | The hostname does not resolve | The endpoint is wrong, or the project or branch was deleted |
+| `connection_refused` | The host exists but is not accepting connections | Check the port; the Neon compute may be suspended or disabled |
+| `timeout` | The attempt ran out of time (often a Neon cold start) | Retry; raise `DATABASE_CONNECT_TIMEOUT` if it recurs |
+| `tls` | TLS negotiation failed | Neon requires TLS: keep `sslmode=require` on `DATABASE_URL` |
+| `authentication` (`28…`) | The role or password was rejected | Re-copy the connection string; the password may have been rotated |
+| `unknown_database` (`3D000`) | The named database does not exist on this branch | Re-copy the connection string |
+| `permission_denied` (`42501`) | The role lacks a privilege | Check the role in Neon |
+| `schema_missing` (`42P01`, or a reachable database with no tables) | The connection works but migrations were never applied | Run the migrations, below |
+| `server_error` | PostgreSQL rejected the connection | The `sqlstate` in the log identifies the cause |
 
-Cross-origin access is opt-in through `WEB_ORIGIN`, and the normal deployment does not need it: the web app calls the API on its own origin, with Vite proxying `/api` in development and `vercel.json` rewriting `/api` in production. Leaving `WEB_ORIGIN` unset grants no cross-origin access.
+Connection and schema are different failures. `Ping` succeeds against a reachable, authenticated database even when it is empty, so a missing schema never appears as "the database is unreachable". The backend logs the target (host, port, database, user, and whether a password is set — never the password itself) and the classification.
 
-If the API must be served from a different origin, set `PUBLIC_API_URL` on the web app to that origin **and** `WEB_ORIGIN` on the API to the web app's origin. Both are required: without `WEB_ORIGIN` the browser's cross-origin request is refused.
+`/healthz` returns 200 whenever the process is up; `/readyz` returns 503 when PostgreSQL cannot be reached at all. That separates "the API is running" from "the database answers".
+
+The server binds its listener and starts answering **before** it tests the database, and it keeps the pool open when that first test fails. pgxpool connects lazily, so a Neon compute that is still waking serves the next request normally; discarding the pool on the first failed ping would turn a temporary outage into a permanent one.
+
+### The bounded connection test
+
+`cmd/dbcheck` runs a read-only, bounded connection test against the same variable the server reads, and prints the same classification. It writes nothing and never prints the connection string:
+
+```sh
+go run ./cmd/dbcheck              # tests DATABASE_URL, the application target
+go run ./cmd/dbcheck DIRECT_URL   # tests the unpooled migration target
+```
+
+Run it in the same environment the deployment uses. It reports two things separately:
+
+- `reachable=false` — a connection problem; `category` and `next step` say which.
+- `reachable=true schema_present=false` — authentication works, but the database has never been migrated.
+
+### Applying migrations
+
+The schema is not created automatically. Applying migrations is a deliberate, manual step against the target database and is never run by the API on start-up. Migrations run over the **direct** endpoint, because the pooled endpoint cannot hold the session-level advisory lock the runner takes:
+
+```sh
+DIRECT_URL='postgres://…direct…' go run ./cmd/migrate
+```
+
+Use the pooled endpoint for `DATABASE_URL` (the server) and the direct endpoint for `DIRECT_URL` (migrations). Both need `sslmode=require` for Neon.
+
+### Split origins (two projects, two domains)
+
+When the frontend and backend are on different domains, set `PUBLIC_API_URL` on the frontend to the backend origin **and** `WEB_ORIGIN` on the backend to the frontend origin. Both are required: without `WEB_ORIGIN` the browser's cross-origin request is refused.
+
+`WEB_ORIGIN` is an exact, comma-separated allow-list. Cross-origin access is opt-in and there is no wildcard — this API spends a paid model call on `/api/v1/questions`, so reflecting an arbitrary `Origin` would let any site spend someone else's quota. A missing `WEB_ORIGIN` grants nothing, and preflight requests are answered only for listed origins.
+
+`PUBLIC_API_URL` is inlined into the browser bundle at build time, so changing it requires a new frontend deployment; it cannot be changed at runtime.
+
+### Cross-origin access on one origin
+
+If both are served from one domain, leave `PUBLIC_API_URL` and `WEB_ORIGIN` unset and let requests stay relative. Vite proxies `/api` during development; on Vercel, the root `vercel.json` routes `/api/(.*)`, `/internal/(.*)`, `/healthz` and `/readyz` to the API service.
 
 `PUBLIC_`-prefixed variables are inlined into the browser bundle by design. Never put a secret behind that prefix.
+
+### Deployment order
+
+1. Apply migrations to the database (manual, once per schema change). Verify with `go run ./cmd/dbcheck DIRECT_URL` — it must report `reachable=true schema_present=true`.
+2. Deploy the backend, with `DATABASE_URL`, `HF_TOKEN` and (for split origins) `WEB_ORIGIN` set. Remove any `API_ADDR` left over from local development.
+3. Verify the backend directly: `/healthz` should be 200, `/readyz` 200, and `/api/v1/nakshatras` should be 200 with 27 entries (not 503, not 500). If a catalogue endpoint returns 503, the log line names the `category`; see *If the reviewed catalogue returns 503* above.
+4. Set `PUBLIC_API_URL` on the frontend if the origins differ.
+5. Deploy the frontend last, so the build picks up `PUBLIC_API_URL`.
+
 
 ## Current limitations
 

@@ -77,6 +77,130 @@ func TestCORSIsOptIn(t *testing.T) {
 	if got := send("https://evil.example"); got != "" {
 		t.Fatalf("unlisted origin was granted: %q", got)
 	}
+
+	// A list is supported, entries are trimmed, and a trailing slash on the
+	// configured origin still matches a real Origin header (which has no path).
+	t.Setenv("WEB_ORIGIN", " https://evergreen-mu-five.vercel.app/ , https://preview.example ")
+	if got := send("https://evergreen-mu-five.vercel.app"); got != "https://evergreen-mu-five.vercel.app" {
+		t.Fatalf("first listed origin was not granted: %q", got)
+	}
+	if got := send("https://preview.example"); got != "https://preview.example" {
+		t.Fatalf("second listed origin was not granted: %q", got)
+	}
+	if got := send("https://evil.example"); got != "" {
+		t.Fatalf("unlisted origin was granted: %q", got)
+	}
+
+	// A wildcard must not become "allow anything", because this API spends a
+	// paid model call on /api/v1/questions.
+	t.Setenv("WEB_ORIGIN", "*")
+	if got := send("https://evil.example"); got != "" {
+		t.Fatalf("wildcard WEB_ORIGIN granted an arbitrary origin: %q", got)
+	}
+}
+
+// A browser sends a preflight before a JSON POST such as /api/v1/questions.
+// The preflight must succeed for an allowed origin and must not be granted for
+// any other, and it must never reach the router (which only knows GET/POST).
+func TestCORSPreflight(t *testing.T) {
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Setenv("WEB_ORIGIN", "https://evergreen-mu-five.vercel.app")
+
+	preflight := func(origin string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodOptions, "/api/v1/questions", nil)
+		r.Header.Set("Origin", origin)
+		r.Header.Set("Access-Control-Request-Method", "POST")
+		r.Header.Set("Access-Control-Request-Headers", "content-type")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	allowed := preflight("https://evergreen-mu-five.vercel.app")
+	if allowed.Code != http.StatusNoContent {
+		t.Fatalf("preflight from an allowed origin returned %d", allowed.Code)
+	}
+	if got := allowed.Header().Get("Access-Control-Allow-Origin"); got != "https://evergreen-mu-five.vercel.app" {
+		t.Fatalf("preflight did not grant the allowed origin: %q", got)
+	}
+	if !strings.Contains(allowed.Header().Get("Access-Control-Allow-Headers"), "Content-Type") {
+		t.Fatalf("preflight did not allow Content-Type: %q", allowed.Header().Get("Access-Control-Allow-Headers"))
+	}
+	if !strings.Contains(allowed.Header().Get("Vary"), "Origin") {
+		t.Fatalf("preflight response is not marked as varying by Origin: %q", allowed.Header().Get("Vary"))
+	}
+
+	denied := preflight("https://evil.example")
+	if denied.Code != http.StatusNoContent {
+		t.Fatalf("preflight from an unrecognised origin returned %d", denied.Code)
+	}
+	if got := denied.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("preflight granted an unrecognised origin: %q", got)
+	}
+}
+
+// The reviewed catalogue describes records that were checked by a person, so if
+// the database holding them cannot be reached the endpoints must say so. Before
+// this, they answered 200 with a built-in list, which is indistinguishable from
+// a reviewed record and implies Everroot checked something it had not.
+func TestReviewedCatalogueIsUnavailableWithoutDatabase(t *testing.T) {
+	t.Setenv("HF_TOKEN", "test-token")
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, path := range []string{
+		"/api/v1/traditions",
+		"/api/v1/nakshatras",
+		"/api/v1/traditions/nakshatra-tree-association/regions",
+	} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: expected 503 when no database is configured, got %d (%s)", path, w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if strings.Contains(body, "Ashwini") || strings.Contains(body, "Nakshatra Tree Association") {
+			t.Fatalf("%s: served built-in catalogue data instead of reporting unavailability: %s", path, body)
+		}
+	}
+}
+
+// A failure to reach PostgreSQL must be diagnosable from the logs without the
+// connection string appearing in them. The driver error can embed the host and
+// user from the DSN, so the handler logs a classification instead.
+func TestCatalogueFailureLogsAreCredentialFree(t *testing.T) {
+	t.Setenv("HF_TOKEN", "test-token")
+	const secret = "sup3r-s3cret-pw"
+	dsn := "postgres://neondb_owner:" + secret + "@127.0.0.1:1/neondb?sslmode=disable&connect_timeout=1"
+
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	var logs bytes.Buffer
+	h, err := New(pool, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/nakshatras", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 with an unreachable database, got %d (%s)", w.Code, w.Body.String())
+	}
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("logs leaked the database password:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "category=") {
+		t.Fatalf("logs should carry a failure category:\n%s", logs.String())
+	}
 }
 
 func TestPublicDiscoveryRequiresKnownValidInput(t *testing.T) {
