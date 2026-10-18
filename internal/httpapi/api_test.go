@@ -45,6 +45,40 @@ func TestAdminRoutesFailClosed(t *testing.T) {
 	}
 }
 
+// Cross-origin access must be opt-in. The web app reaches the API on its own
+// origin (Vite proxies /api in development, vercel.json rewrites it in
+// production), so an unset WEB_ORIGIN must not grant anything — otherwise any
+// site could drive the paid model calls behind /api/v1/questions.
+func TestCORSIsOptIn(t *testing.T) {
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	send := func(origin string) string {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/trees", nil)
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Header().Get("Access-Control-Allow-Origin")
+	}
+
+	t.Setenv("WEB_ORIGIN", "")
+	if got := send("https://evil.example"); got != "" {
+		t.Fatalf("unset WEB_ORIGIN granted cross-origin access: %q", got)
+	}
+
+	t.Setenv("WEB_ORIGIN", "https://everroot.example")
+	if got := send("https://everroot.example"); got != "https://everroot.example" {
+		t.Fatalf("configured origin was not granted: %q", got)
+	}
+	if got := send("https://evil.example"); got != "" {
+		t.Fatalf("unlisted origin was granted: %q", got)
+	}
+}
+
 func TestPublicDiscoveryRequiresKnownValidInput(t *testing.T) {
 	t.Setenv("HF_TOKEN", "test-token")
 	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))

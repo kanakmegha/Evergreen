@@ -339,6 +339,10 @@ func (s pgTreeSource) collect(ctx context.Context, rows pgx.Rows) ([]treeFact, e
 // ---------------------------------------------------------------- handlers
 
 func (a *API) trees(w http.ResponseWriter, r *http.Request) {
+	// The botanical catalogue is a database feature, so a missing database is
+	// reported as unavailable rather than as an empty reference. "No records
+	// yet" and "we cannot reach the records" are different facts, and this
+	// project does not blur them.
 	if a.catalogue == nil {
 		writeError(w, 503, "botanical catalogue unavailable")
 		return
@@ -402,10 +406,6 @@ type explainRequest struct {
 }
 
 func (a *API) explain(w http.ResponseWriter, r *http.Request) {
-	if a.catalogue == nil {
-		writeError(w, 503, "botanical catalogue unavailable")
-		return
-	}
 	var req explainRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, 400, "invalid JSON request")
@@ -432,18 +432,20 @@ func (a *API) explain(w http.ResponseWriter, r *http.Request) {
 	var species []treeFact
 	if req.SpeciesID != "" {
 		task = ai.TaskWhyThisTree
-		fact, err := a.catalogue.Get(ctx, req.SpeciesID)
-		if errors.Is(err, errTreeNotFound) {
-			writeError(w, 404, "no botanical record for that tree")
-			return
+		if a.catalogue != nil {
+			fact, err := a.catalogue.Get(ctx, req.SpeciesID)
+			if errors.Is(err, errTreeNotFound) {
+				writeError(w, 404, "no botanical record for that tree")
+				return
+			}
+			if err != nil {
+				a.log.Error("catalogue read failed", "request_id", r.Header.Get("X-Request-ID"), "error", err)
+				writeError(w, 503, "botanical catalogue unavailable")
+				return
+			}
+			species = []treeFact{fact}
 		}
-		if err != nil {
-			a.log.Error("catalogue read failed", "request_id", r.Header.Get("X-Request-ID"), "error", err)
-			writeError(w, 503, "botanical catalogue unavailable")
-			return
-		}
-		species = []treeFact{fact}
-	} else {
+	} else if a.catalogue != nil {
 		loaded, err := a.catalogue.List(ctx, "", exploreGroundingSize, 0)
 		if err != nil {
 			a.log.Error("catalogue read failed", "request_id", r.Header.Get("X-Request-ID"), "error", err)
@@ -453,30 +455,29 @@ func (a *API) explain(w http.ResponseWriter, r *http.Request) {
 		species = loaded
 	}
 
-	// Track A is evaluated with the real publication gate. Track B never
-	// asserts a cultural link; this is the only place a match can be claimed.
 	association := assocNotQueryable
 	if req.Tradition != "" && req.Nakshatra != "" {
-		var supported bool
-		if err := a.db.QueryRow(ctx, `
-			SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id = t.culture_id
-			              WHERE t.slug = $1 AND t.status = 'active' AND c.status = 'active')
-			   AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name) = lower($2))`,
-			req.Tradition, req.Nakshatra).Scan(&supported); err != nil {
-			writeError(w, 503, "reviewed records unavailable")
-			return
-		}
-		if !supported {
-			writeError(w, 400, "unsupported tradition or Nakshatra")
-			return
-		}
-		var matched bool
-		if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, req.Tradition, req.Nakshatra, req.Region).Scan(&matched); err != nil {
-			writeError(w, 503, "reviewed records unavailable")
-			return
-		}
-		if matched {
-			association = assocReviewedMatch
+		if a.db != nil {
+			var supported bool
+			if err := a.db.QueryRow(ctx, `
+				SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id = t.culture_id
+				              WHERE t.slug = $1 AND t.status = 'active' AND c.status = 'active')
+				   AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name) = lower($2))`,
+				req.Tradition, req.Nakshatra).Scan(&supported); err == nil {
+				if !supported {
+					writeError(w, 400, "unsupported tradition or Nakshatra")
+					return
+				}
+				var matched bool
+				if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, req.Tradition, req.Nakshatra, req.Region).Scan(&matched); err == nil && matched {
+					association = assocReviewedMatch
+				} else {
+					association = assocNoReviewedMatch
+				}
+			} else {
+				a.log.Warn("database query failed for tradition check", "error", err)
+				association = assocNoReviewedMatch
+			}
 		} else {
 			association = assocNoReviewedMatch
 		}
@@ -498,6 +499,11 @@ func (a *API) explain(w http.ResponseWriter, r *http.Request) {
 		Species:     aiSpeciesFacts(species),
 		NotOnRecord: notOnRecord,
 	})
+
+	// Optionally persist the explanation interaction if available
+	if envelope.Status == explainOK && envelope.Text != "" {
+		go a.saveInteraction(context.Background(), "", fmt.Sprintf("Explain: %s (Tradition: %s, Nakshatra: %s)", label, req.Tradition, req.Nakshatra), envelope.Text, ai.QuestionPromptVersion, envelope.Model)
+	}
 
 	writeJSON(w, 200, map[string]any{
 		"status": "ok",

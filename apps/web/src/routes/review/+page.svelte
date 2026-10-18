@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { apiURL } from '$lib/discovery';
   type Evidence={title:string;url:string;locator:string;relationship:string;reuseStatus:string;verificationStatus:string;originalText:string|null;translation:string|null};
   type QueueItem={revisionId:string;mappingId:string;version:number;tradition:string;region:string;nakshatra:string;claim:string;interpretation:string;latestReview:string;publicationState:string;sources:Evidence[];botanicalCandidates:{scientificName:string;certainty:string;confidence:number;reviewStatus:string;evidence:Evidence[]}[]};
   let queue:QueueItem[]=$state([]);let message=$state('');let error=$state('');
@@ -7,7 +8,7 @@
   let sourceId=$state('');let evidence=$state({locator:'',language:'en',originalText:'',evidenceNotes:''});let evidenceId=$state('');
   let mapping=$state({mappingId:'',tradition:'nakshatra-tree-association',regionCode:'',nakshatra:'',claim:'',interpretation:'',evidenceId:''});
   let botanicalJSON=$state('');let botanicalCandidateIds:string[]=$state([]);
-  async function call(path:string,body?:unknown){const response=await fetch(path,{method:body?'POST':'GET',headers:{'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});if(!response.ok){const b=await response.json().catch(()=>({}));throw new Error(b.error??`Request failed (${response.status})`)}return response.status===204?null:response.json()}
+  async function call(path:string,body?:unknown){const response=await fetch(apiURL(path),{method:body?'POST':'GET',headers:{'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});if(!response.ok){const b=await response.json().catch(()=>({}));throw new Error(b.error??`Request failed (${response.status})`)}return response.status===204?null:response.json()}
   async function refresh(){try{queue=await call('/internal/v1/review/queue');error=''}catch(e){error=e instanceof Error?e.message:'Could not load queue.'}}
   async function createSource(){try{const b=await call('/internal/v1/sources',{...source,publicationDate:source.publicationDate||null});sourceId=b.id;message=`Source saved as ${sourceId}. It is unverified until reviewed.`;await refresh()}catch(e){error=e instanceof Error?e.message:'Could not save source.'}}
   async function createEvidence(){try{const b=await call(`/internal/v1/sources/${sourceId}/evidence`,{...evidence,originalText:evidence.originalText||null,translationRights:'not_applicable'});evidenceId=b.id;message=`Evidence saved as ${evidenceId}.`; }catch(e){error=e instanceof Error?e.message:'Could not save evidence.'}}

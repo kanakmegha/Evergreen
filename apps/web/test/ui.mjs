@@ -27,7 +27,9 @@ const VIEWPORTS = [
   { name: 'small', width: 320, height: 700 },
 ];
 
-const NO_MATCH_NOTICE = /botanical explorations—not Nakshatra recommendations/;
+// The single no-match notice. It reframes the absence as a deliberate choice
+// ("rather than guess") rather than a failed lookup, and must appear once.
+const NO_MATCH_NOTICE = /Rather than guess[\s\S]*not Nakshatra recommendations/;
 
 let passed = 0;
 const failures = [];

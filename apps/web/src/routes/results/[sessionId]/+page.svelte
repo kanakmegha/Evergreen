@@ -8,6 +8,7 @@
   import { filterTrees } from '../../../lib/treeOption';
   import type { TreeOptionView } from '../../../lib/treeOption';
   import {
+    askQuestion,
     clearFlow,
     discoveryRequest,
     emptyAnswers,
@@ -26,6 +27,7 @@
     runExplain,
     saveDedication,
     saveRecord,
+    submitFeedback,
     toggleSaved,
     usesNakshatra,
   } from '../../../lib/discovery';
@@ -80,6 +82,52 @@
   let openRowId = $state('');
   /** Which shortlist option has its "Why this option?" detail open. */
   let openOptionKey = $state('');
+
+  /* --------------------------------------------- user AI questions & feedback */
+  let userQuestion = $state('');
+  let questionAnswer = $state<string | null>(null);
+  let questionInteractionId = $state<string | null>(null);
+  let questionLoading = $state(false);
+  let questionError = $state('');
+  let feedbackGiven = $state<number | null>(null);
+
+  async function handleAskQuestion() {
+    const q = userQuestion.trim();
+    if (!q || questionLoading) return;
+    questionLoading = true;
+    questionError = '';
+    feedbackGiven = null;
+    try {
+      const res = await askQuestion({
+        question: q,
+        sessionId: record?.id,
+        intention: answers.intention ?? '',
+        context: {
+          Tradition: answers.tradition ?? '',
+          Nakshatra: answers.nakshatra ?? '',
+          Region: answers.region ?? '',
+        },
+      });
+      questionAnswer = res.answer;
+      questionInteractionId = res.interactionId ?? null;
+    } catch (e) {
+      questionError = e instanceof Error ? e.message : 'Could not generate answer. Please try again.';
+    } finally {
+      questionLoading = false;
+    }
+  }
+
+  async function handleFeedback(rating: number) {
+    if (feedbackGiven !== null) return;
+    feedbackGiven = rating;
+    if (questionInteractionId) {
+      await submitFeedback({
+        interactionId: questionInteractionId,
+        rating,
+        feedbackType: 'answer',
+      });
+    }
+  }
 
   /* ------------------------------------------------------------- derived */
 
@@ -150,24 +198,26 @@
     }
     if (!record || record.error) return '';
     if (needsNakshatra) {
-      return 'You skipped the Nakshatra step, so there is no cultural record to check. These are botanical explorations—not Nakshatra recommendations.';
+      return 'You skipped the Nakshatra step, so there is no cultural record to check. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
     }
     if (!queryable) {
-      return 'Your answers are not part of Everroot’s reviewed cultural dataset, so there is nothing cultural to verify. These are botanical explorations—not Nakshatra recommendations.';
+      return 'Your answers are outside Everroot’s reviewed cultural dataset, so there is no cultural record to check. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
     }
-    return 'We couldn’t verify a cultural association for this exact selection, so these are botanical explorations—not Nakshatra recommendations.';
+    return 'There is no reviewed cultural association on record for this selection yet. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
   });
 
   const ledeIsNotice = $derived(!hasResults);
 
-  /** A discreet indicator of what backs the page, not a promise about the trees. */
+  /**
+   * A discreet indicator of what backs the page, not a promise about the trees.
+   * A missing reviewed record is described as scope ("botanical records only"),
+   * never as a verdict about the visitor's selection — the single notice in the
+   * lede already carries that.
+   */
   const evidencePill = $derived.by<{ text: string; tone: 'ok' | 'none' } | null>(() => {
     if (hasResults) return { text: 'Reviewed association on record', tone: 'ok' };
     if (!culturalAssociation) return null;
     if (culturalAssociation === 'reviewed_match') return { text: 'Reviewed record exists', tone: 'ok' };
-    if (culturalAssociation === 'no_reviewed_match') {
-      return { text: 'No verified cultural match', tone: 'none' };
-    }
     return { text: 'Botanical records only', tone: 'none' };
   });
 
@@ -568,6 +618,71 @@
             {/if}
           </section>
         {/if}
+
+        <!-- ----------------------------- Ask Everroot AI Question Section -->
+        <section class="card-surface panel" style="margin: 1.5rem 0; padding: 1.25rem;">
+          <h2 style="font-size: 1.15rem; font-weight: 650; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem;">
+            <Icon name="sparkle" size={18} /> Ask about a tree
+          </h2>
+          <p style="font-size: 0.9rem; color: #53645c; margin-bottom: 0.75rem;">
+            Ask a botanical question and a language model will answer from general knowledge. Cultural associations never come from here — those appear only with Everroot's reviewed sources attached.
+          </p>
+          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+            <input
+              type="text"
+              class="input"
+              style="flex: 1; min-width: 240px; padding: 0.6rem 0.8rem; border-radius: 8px; border: 1px solid #c8d0c8; font-size: 0.95rem;"
+              placeholder="e.g. What family does Jamun belong to, or how tall does Sal grow?"
+              bind:value={userQuestion}
+              onkeydown={(e) => { if (e.key === 'Enter') void handleAskQuestion(); }}
+              disabled={questionLoading}
+            />
+            <button
+              class="btn btn--primary btn--sm"
+              type="button"
+              onclick={handleAskQuestion}
+              disabled={questionLoading || !userQuestion.trim()}
+            >
+              {questionLoading ? 'Asking…' : 'Ask'}
+            </button>
+          </div>
+
+          {#if questionError}
+            <p style="color: #a22d26; font-size: 0.88rem; margin-top: 0.5rem;" role="alert">{questionError}</p>
+          {/if}
+
+          {#if questionAnswer}
+            <div style="margin-top: 1rem; padding: 1rem; background: #f6f8f6; border-radius: 8px; border-left: 3px solid #27664e;">
+              <p style="font-size: 0.95rem; line-height: 1.5; color: #1e332a; white-space: pre-wrap;">{questionAnswer}</p>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+                <span style="font-size: 0.78rem; color: #68756c;">
+                  Machine-written from general botanical knowledge · not a reviewed record
+                </span>
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                  <span style="font-size: 0.82rem; color: #53645c;">Was this helpful?</span>
+                  <button
+                    type="button"
+                    class="btn btn--soft btn--sm"
+                    style="padding: 0.2rem 0.5rem; font-size: 0.8rem;"
+                    onclick={() => void handleFeedback(1)}
+                    disabled={feedbackGiven !== null}
+                  >
+                    {feedbackGiven === 1 ? '✓ Helpful' : '👍 Helpful'}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn--soft btn--sm"
+                    style="padding: 0.2rem 0.5rem; font-size: 0.8rem;"
+                    onclick={() => void handleFeedback(-1)}
+                    disabled={feedbackGiven !== null}
+                  >
+                    {feedbackGiven === -1 ? '✓ Noted' : '👎 Not helpful'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </section>
 
         <!-- ----------------------------- C. the rest, progressively disclosed -->
         <section class="cat card-surface" aria-labelledby="catalogue-title">

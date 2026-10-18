@@ -210,8 +210,19 @@ export interface Nakshatra {
 
 export const NAKSHATRA_TRADITION = 'nakshatra-tree-association';
 
+/**
+ * apiURL resolves a path against PUBLIC_API_URL if configured in production,
+ * or falls back to a same-origin relative path.
+ */
+export function apiURL(path: string): string {
+  const base = typeof import.meta !== 'undefined' && (import.meta as any).env?.PUBLIC_API_URL
+    ? String((import.meta as any).env.PUBLIC_API_URL).replace(/\/+$/, '')
+    : '';
+  return `${base}${path}`;
+}
+
 async function getJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
+  const res = await fetch(apiURL(url), { headers: { accept: 'application/json' } });
   if (!res.ok) throw new Error(`Request failed (${res.status})`);
   return (await res.json()) as T;
 }
@@ -247,7 +258,7 @@ export interface ConversationSession {
 export async function fetchSession(sessionId: string): Promise<ConversationSession | null> {
   try {
     const res = await fetch(
-      `/api/v1/conversation?session_id=${encodeURIComponent(sessionId)}`,
+      apiURL(`/api/v1/conversation?session_id=${encodeURIComponent(sessionId)}`),
       { headers: { accept: 'application/json' } }
     );
     if (!res.ok) return null;
@@ -309,7 +320,7 @@ export interface DiscoveryRequestInput {
 export async function runDiscovery(input: DiscoveryRequestInput): Promise<DiscoveryResponse> {
   let res: Response;
   try {
-    res = await fetch('/api/v1/discoveries', {
+    res = await fetch(apiURL('/api/v1/discoveries'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(input),
@@ -422,7 +433,7 @@ export async function fetchCatalogue(query = ''): Promise<CatalogueResponse> {
   const suffix = query ? `?q=${encodeURIComponent(query)}` : '';
   let res: Response;
   try {
-    res = await fetch(`/api/v1/trees${suffix}`, { headers: { accept: 'application/json' } });
+    res = await fetch(apiURL(`/api/v1/trees${suffix}`), { headers: { accept: 'application/json' } });
   } catch {
     throw new Error('The botanical reference could not be reached from this browser.');
   }
@@ -446,7 +457,7 @@ export async function fetchCatalogue(query = ''): Promise<CatalogueResponse> {
 export async function runExplain(input: ExplainInput): Promise<ExplainResponse> {
   let res: Response;
   try {
-    res = await fetch('/api/v1/explain', {
+    res = await fetch(apiURL('/api/v1/explain'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(input),
@@ -756,5 +767,57 @@ export function validURL(value: string): string | null {
     return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
   } catch {
     return null;
+  }
+}
+
+/* --- User AI Questions & Feedback --- */
+
+export interface QuestionRequest {
+  question: string;
+  sessionId?: string;
+  intention?: string;
+  context?: Record<string, string>;
+}
+
+export interface QuestionResponse {
+  status: string;
+  interactionId?: string;
+  question: string;
+  answer: string;
+  promptVersion: string;
+  model: string;
+  disclaimer: string;
+}
+
+export async function askQuestion(input: QuestionRequest): Promise<QuestionResponse> {
+  const res = await fetch(apiURL('/api/v1/questions'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const errData = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(errData.error ?? `AI request failed (${res.status})`);
+  }
+  return (await res.json()) as QuestionResponse;
+}
+
+export interface FeedbackInput {
+  interactionId?: string;
+  feedbackType?: 'answer' | 'website';
+  rating?: number;
+  comment?: string;
+  correction?: string;
+}
+
+export async function submitFeedback(input: FeedbackInput): Promise<void> {
+  try {
+    await fetch(apiURL('/api/v1/feedback'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(input),
+    });
+  } catch {
+    // Non-blocking
   }
 }

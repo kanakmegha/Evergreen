@@ -479,6 +479,13 @@ func trimSuffix(s, suffix string) string {
 
 // getOrCreateSession loads an existing session or creates a new one.
 func (m *Manager) getOrCreateSession(ctx context.Context, sessionID string) (*Session, error) {
+	if m.db == nil {
+		id := sessionID
+		if id == "" {
+			id = fmt.Sprintf("anon-%d", time.Now().UnixNano())
+		}
+		return &Session{ID: id, State: StateGreeting, ExpiresAt: time.Now().Add(24 * time.Hour)}, nil
+	}
 	if sessionID != "" {
 		var s Session
 		var intent, tradition, region, nakshatra sql.NullString
@@ -521,6 +528,9 @@ func (m *Manager) getOrCreateSession(ctx context.Context, sessionID string) (*Se
 
 // saveSession persists session state.
 func (m *Manager) saveSession(ctx context.Context, s *Session) error {
+	if m.db == nil {
+		return nil
+	}
 	var mappingID, revisionID any
 	if s.DiscoveryMappingID != nil {
 		mappingID = *s.DiscoveryMappingID
@@ -540,6 +550,9 @@ func (m *Manager) saveSession(ctx context.Context, s *Session) error {
 
 // GetSession returns a session by ID if it has not expired.
 func (m *Manager) GetSession(ctx context.Context, sessionID string) (*Session, error) {
+	if m.db == nil {
+		return nil, sql.ErrNoRows
+	}
 	var s Session
 	var intent, tradition, region, nakshatra sql.NullString
 	var mappingID, revisionID sql.NullString

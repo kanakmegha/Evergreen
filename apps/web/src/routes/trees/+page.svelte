@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { page } from '$app/state';
   import Icon from '../../lib/components/Icon.svelte';
   import TreeOption from '../../lib/components/TreeOption.svelte';
   import { referenceOption, filterTrees } from '../../lib/treeOption';
   import type { TreeOptionView } from '../../lib/treeOption';
+  import { absoluteUrl } from '../../lib/site';
   import {
     explanationFailureText,
     fetchCatalogue,
@@ -111,6 +113,7 @@
     name="description"
     content="Everroot's botanical reference: accepted tree names, plant classification and the authority record behind each fact. Not a cultural association."
   />
+  <link rel="canonical" href={absoluteUrl('/trees', page.url.origin)} />
 </svelte:head>
 
 <div class="page">

@@ -125,10 +125,58 @@ All claims or names entered through this interface are editorial inputs and need
 
 The OpenAPI contract is in [`api/openapi.yaml`](api/openapi.yaml). Public endpoints provide traditions, the Nakshatra vocabulary, and source-backed discovery. Internal endpoints are local-only and protected by Go middleware. Health and readiness endpoints are `/healthz` and `/readyz`.
 
+### Answering a question
+
+`POST /api/v1/questions` (aliased as `/api/v1/ask`) answers an open question. The request path is:
+
+1. The browser posts a question to the Go API.
+2. The API validates the input and builds the prompt (`internal/ai/qa.go`).
+3. The API calls the configured Hugging Face model using `HF_TOKEN`, `HF_MODEL_ID` and `HF_BASE_URL`.
+4. The API returns the model's answer to the browser.
+5. Separately, the interaction is written to PostgreSQL when it is reachable.
+
+PostgreSQL is **not** on the answer path. A database outage never prevents an otherwise successful model call from answering, and a failed write never fails the response. No table is consulted to produce an answer, and there is no fallback to stored content.
+
+The question prompt carries the same rule as the rest of Everroot: the model must never state or imply that a tree is associated with a nakshatra, religion, community, region, deity, festival or scripture. Cultural claims are shown only when a reviewed source backs them.
+
+Feedback is posted to `POST /api/v1/feedback` and is independent of answer generation.
+
+## Deploying
+
+Three values must be supplied by the deployment. Nothing in the repository invents a production host or a secret.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | For persistence only | PostgreSQL connection for interactions and feedback. The API starts, and answers questions, without it. |
+| `HF_TOKEN` | To answer questions | Hugging Face credentials. Never commit it, and never expose it to the browser. |
+| `PUBLIC_SITE_URL` | Before launch | The public origin, for example `https://example.org`. Used for canonical links, `robots.txt` and `sitemap.xml`. |
+
+### The production domain is not set anywhere
+
+`PUBLIC_SITE_URL` is the only place a public origin is configured. When it is unset, canonical links, `robots.txt` and `sitemap.xml` are generated from the origin each request arrived on, so they always match the domain actually serving the site — a platform subdomain, a preview URL, or a real domain. Set it when the canonical origin must differ from the serving host, for example so a platform subdomain is not indexed as the canonical address.
+
+### Static asset still required
+
+`apps/web/src/lib/site.ts` references `/og-hero.png` for social previews. That image is not in the repository yet; add a 1200×630 image at `apps/web/static/og-hero.png`.
+
+### Health and readiness
+
+`/healthz` reports that the process is up and does not touch the database. `/readyz` reports database readiness and returns 503 when PostgreSQL is unreachable, so a platform health check can tell "the API is running" apart from "persistence is available".
+
+### Cross-origin access
+
+Cross-origin access is opt-in through `WEB_ORIGIN`, and the normal deployment does not need it: the web app calls the API on its own origin, with Vite proxying `/api` in development and `vercel.json` rewriting `/api` in production. Leaving `WEB_ORIGIN` unset grants no cross-origin access.
+
+If the API must be served from a different origin, set `PUBLIC_API_URL` on the web app to that origin **and** `WEB_ORIGIN` on the API to the web app's origin. Both are required: without `WEB_ORIGIN` the browser's cross-origin request is refused.
+
+`PUBLIC_`-prefixed variables are inlined into the browser bundle by design. Never put a secret behind that prefix.
+
 ## Current limitations
 
-- No real cultural sources or mappings have been imported; only catalog selectors exist.
+- No real cultural sources or mappings have been imported; only catalog selectors exist. The public cultural path therefore has no data behind it yet.
 - No external identity provider is integrated. The review workflow is for trusted localhost development only.
-- No birth-date/time calculations, chat/LLM, accounts, save/share, planting partners, analytics, or marketing are included.
+- No birth-date/time calculations, accounts, save/share, planting partners, analytics, or marketing are included.
+- `POST /api/v1/questions` answers from general model knowledge. It is deliberately not treated as evidence, and nothing it returns is stored as a reviewed record.
+- Interaction and feedback retention is unmanaged: `user_interactions` and `user_feedback` have no automatic expiry. Add a retention and deletion policy before collecting real user questions.
 - Source metadata is entered and reviewed, but external link rot and licence interpretation still require human follow-up.
-- API throttling, production secrets, backup policy, deployment, and external security review remain future work.
+- API throttling, production secrets, backup policy, and external security review remain future work.

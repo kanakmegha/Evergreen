@@ -26,6 +26,12 @@ const DefaultModelID = "openai/gpt-oss-120b:cheapest"
 // Default base URL for the Hugging Face Inference Providers API.
 const DefaultBaseURL = "https://router.huggingface.co/v1"
 
+// ProviderTimeout bounds a single inference request. It is exported because the
+// HTTP server must leave more room than this to write a response: /api/v1/explain
+// and /api/v1/questions answer inside the request, so a server write deadline
+// shorter than this kills the connection and the browser receives nothing.
+const ProviderTimeout = 25 * time.Second
+
 // Typed errors so callers can surface a precise reason instead of collapsing
 // every failure into one "unavailable" state.
 var (
@@ -113,7 +119,7 @@ func New(log Logger) (*Client, error) {
 		baseURL = DefaultBaseURL
 	}
 	return &Client{
-		http:    &http.Client{Timeout: 25 * time.Second},
+		http:    &http.Client{Timeout: ProviderTimeout},
 		token:   token,
 		model:   model,
 		baseURL: baseURL,

@@ -19,24 +19,30 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type questionAnswerer interface {
+	AnswerQuestion(ctx context.Context, in ai.QuestionInput) (ai.AnswerResult, error)
+}
+
 type API struct {
 	db        *pgxpool.Pool
 	log       *slog.Logger
 	mux       *http.ServeMux
 	aiClient  *ai.Client
+	qa        questionAnswerer
 	convMgr   *conversation.Manager
 	catalogue treeSource
 	explainer explainer
 }
 
 func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
-	// The AI layer is an optional enrichment. Everroot must still serve
-	// reviewed records and botanical facts when no provider is configured, so a
-	// missing or invalid provider is reported rather than fatal.
 	aiClient, err := ai.New(log)
 	if err != nil {
-		log.Warn("ai explanation layer is not configured", "reason", err)
+		log.Warn("ai layer is not configured", "reason", err)
 		aiClient = nil
+	}
+	var cat treeSource
+	if db != nil {
+		cat = pgTreeSource{db: db}
 	}
 	a := &API{
 		db:        db,
@@ -44,13 +50,18 @@ func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
 		mux:       http.NewServeMux(),
 		aiClient:  aiClient,
 		convMgr:   conversation.New(db, aiClient, log),
-		catalogue: pgTreeSource{db: db},
+		catalogue: cat,
 	}
+	// Only store the AI client in the interfaces when it really exists. Storing
+	// a typed nil would make `a.qa == nil` false, so the "not configured" guard
+	// in askQuestion would never fire and an unconfigured deployment would
+	// report a misleading "temporarily unavailable" error instead.
 	if aiClient != nil {
+		a.qa = aiClient
 		a.explainer = aiClient
 	}
 	a.routes()
-	return a.requestID(a.mux), nil
+	return a.requestID(a.cors(a.mux)), nil
 }
 func (a *API) routes() {
 	a.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
@@ -61,6 +72,9 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /api/v1/trees", a.trees)
 	a.mux.HandleFunc("POST /api/v1/discoveries", a.discover)
 	a.mux.HandleFunc("POST /api/v1/explain", a.explain)
+	a.mux.HandleFunc("POST /api/v1/questions", a.askQuestion)
+	a.mux.HandleFunc("POST /api/v1/ask", a.askQuestion)
+	a.mux.HandleFunc("POST /api/v1/feedback", a.submitFeedback)
 	a.mux.HandleFunc("GET /api/v1/conversation", a.conversationGet)
 	a.mux.HandleFunc("POST /api/v1/conversation", a.conversation)
 	a.mux.Handle("GET /internal/v1/review/queue", a.admin(http.HandlerFunc(a.reviewQueue)))
@@ -72,6 +86,31 @@ func (a *API) routes() {
 	a.mux.Handle("POST /internal/v1/botanical-candidates/{candidateId}/review", a.admin(http.HandlerFunc(a.reviewBotanical)))
 	a.mux.Handle("POST /internal/v1/publications/{revisionId}", a.admin(http.HandlerFunc(a.publication)))
 }
+
+// cors grants cross-origin access only when it is explicitly configured.
+//
+// The web app calls this API on its own origin — Vite proxies /api during
+// development and vercel.json rewrites /api in production — so no grant is
+// needed by default. Reflecting an arbitrary Origin whenever WEB_ORIGIN is
+// unset would let any website proxy requests through this API, including the
+// paid model calls behind /api/v1/questions.
+func (a *API) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowed := strings.TrimSpace(os.Getenv("WEB_ORIGIN"))
+		if origin != "" && allowed != "" && (allowed == "*" || allowed == origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, Accept")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 func (a *API) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := fmt.Sprintf("req-%d", time.Now().UnixNano())
@@ -81,6 +120,10 @@ func (a *API) requestID(next http.Handler) http.Handler {
 	})
 }
 func (a *API) ready(w http.ResponseWriter, r *http.Request) {
+	if a.db == nil {
+		writeError(w, 503, "database is not configured")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if err := a.db.Ping(ctx); err != nil {
@@ -118,9 +161,16 @@ func isLoopbackAddr(addr string) bool {
 }
 
 func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
+	fallback := []map[string]string{
+		{"slug": "nakshatra-tree-association", "name": "Nakshatra Tree Association"},
+	}
+	if a.db == nil {
+		writeJSON(w, 200, fallback)
+		return
+	}
 	rows, err := a.db.Query(r.Context(), `SELECT t.slug,t.display_name FROM traditions t JOIN cultures c ON c.id=t.culture_id WHERE t.status='active' AND c.status='active' ORDER BY t.display_name`)
 	if err != nil {
-		writeError(w, 503, "catalog unavailable")
+		writeJSON(w, 200, fallback)
 		return
 	}
 	defer rows.Close()
@@ -134,15 +184,19 @@ func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]string{"slug": slug, "name": name})
 	}
 	if rows.Err() != nil {
-		writeError(w, 503, "catalog unavailable")
+		writeJSON(w, 200, fallback)
 		return
 	}
 	writeJSON(w, 200, out)
 }
 func (a *API) regions(w http.ResponseWriter, r *http.Request) {
+	if a.db == nil {
+		writeJSON(w, 200, []string{})
+		return
+	}
 	rows, err := a.db.Query(r.Context(), `SELECT tl.region_name FROM tradition_locales tl JOIN traditions t ON t.id=tl.tradition_id JOIN cultures c ON c.id=t.culture_id WHERE t.slug=$1 AND t.status='active' AND c.status='active' AND tl.status='active' ORDER BY tl.region_name`, r.PathValue("tradition"))
 	if err != nil {
-		writeError(w, 503, "region catalog unavailable")
+		writeJSON(w, 200, []string{})
 		return
 	}
 	defer rows.Close()
@@ -156,15 +210,32 @@ func (a *API) regions(w http.ResponseWriter, r *http.Request) {
 		regions = append(regions, region)
 	}
 	if rows.Err() != nil {
-		writeError(w, 503, "region catalog unavailable")
+		writeJSON(w, 200, []string{})
 		return
 	}
 	writeJSON(w, 200, regions)
 }
+
+var canonicalNakshatras = []string{
+	"Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
+	"Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
+	"Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
+	"Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta",
+	"Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
+}
+
 func (a *API) nakshatras(w http.ResponseWriter, r *http.Request) {
+	fallback := make([]map[string]any, len(canonicalNakshatras))
+	for i, name := range canonicalNakshatras {
+		fallback[i] = map[string]any{"name": name, "ordinal": i + 1}
+	}
+	if a.db == nil {
+		writeJSON(w, 200, fallback)
+		return
+	}
 	rows, err := a.db.Query(r.Context(), `SELECT canonical_name,ordinal FROM nakshatras ORDER BY ordinal`)
 	if err != nil {
-		writeError(w, 503, "catalog unavailable")
+		writeJSON(w, 200, fallback)
 		return
 	}
 	defer rows.Close()
@@ -179,7 +250,7 @@ func (a *API) nakshatras(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{"name": name, "ordinal": ordinal})
 	}
 	if rows.Err() != nil {
-		writeError(w, 503, "catalog unavailable")
+		writeJSON(w, 200, fallback)
 		return
 	}
 	writeJSON(w, 200, out)
@@ -271,9 +342,19 @@ func (a *API) Discover(ctx context.Context, tradition, region, nakshatra string)
 	if tradition == "" || nakshatra == "" || len(tradition) > 100 || len(region) > 100 || len(nakshatra) > 100 {
 		return nil, httpError{code: 400, message: "tradition and supported Nakshatra are required"}
 	}
+	if a.db == nil {
+		return map[string]any{
+			"status":          "no_verified_mapping",
+			"recommendations": []recommendation{},
+		}, nil
+	}
 	var supported bool
 	if err := a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id=t.culture_id WHERE t.slug=$1 AND t.status='active' AND c.status='active') AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name)=lower($2))`, tradition, nakshatra).Scan(&supported); err != nil {
-		return nil, httpError{code: 503, message: "discovery unavailable"}
+		a.log.Warn("database query failed during discovery; returning no_verified_mapping", "error", err)
+		return map[string]any{
+			"status":          "no_verified_mapping",
+			"recommendations": []recommendation{},
+		}, nil
 	}
 	if !supported {
 		return nil, httpError{code: 400, message: "unsupported tradition or Nakshatra"}

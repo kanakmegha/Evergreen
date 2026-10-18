@@ -151,8 +151,8 @@ test('a reference record carries no cultural claim and labels itself honestly', 
 test('the selection rule is one or two short sentences and claims no match', () => {
   const words = REFERENCE_RULE.split(/\s+/).filter(Boolean);
   assert.ok(words.length >= 20 && words.length <= 35, `rule was ${words.length} words`);
-  assert.match(REFERENCE_RULE, /ordered by family and accepted name/);
-  assert.match(REFERENCE_RULE, /Not a personal match/);
+  assert.match(REFERENCE_RULE, /botanical reference/);
+  assert.match(REFERENCE_RULE, /not because it matches your answers/);
   assert.match(REFERENCE_RULE, /not a recommendation/);
   // The cultural point is made once at the top of the page, not on every card.
   assert.doesNotMatch(REFERENCE_RULE, /cultural/i);

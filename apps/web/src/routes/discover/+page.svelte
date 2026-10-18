@@ -5,6 +5,7 @@
   import Icon from '../../lib/components/Icon.svelte';
   import SelectableCard from '../../lib/components/SelectableCard.svelte';
   import StepProgress from '../../lib/components/StepProgress.svelte';
+  import { absoluteUrl } from '../../lib/site';
   import {
     FOLLOW_UPS,
     INTENTIONS,
@@ -287,7 +288,7 @@
     name="description"
     content="Begin with what matters to you. Everroot asks about your intention first, then looks for reviewed tree associations with their sources attached. No account, no birth date."
   />
-  <link rel="canonical" href="https://everroot.org/discover" />
+  <link rel="canonical" href={absoluteUrl('/discover', page.url.origin)} />
 </svelte:head>
 
 <div class="discover">

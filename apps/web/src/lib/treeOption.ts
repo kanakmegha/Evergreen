@@ -71,7 +71,7 @@ const REVIEWED = new Set(['verified', 'approved', 'published', 'reviewed']);
  * option's evidence panel, rather than on every card.
  */
 export const REFERENCE_RULE =
-  'Listed from Everroot’s botanical reference, which is ordered by family and accepted name. Not a personal match, and not a recommendation.';
+  'A record from Everroot’s botanical reference, listed because it exists there — not because it matches your answers, and not a recommendation.';
 
 /** Facts Everroot has no reviewed source for. Admitted, never filled in. */
 export const REFERENCE_GAPS = [

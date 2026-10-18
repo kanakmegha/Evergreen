@@ -1,5 +1,10 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import Icon from '../lib/components/Icon.svelte';
+  import { absoluteUrl, OG_IMAGE_PATH, SITE_ALTERNATE_NAME, SITE_NAME } from '../lib/site';
+
+  const canonical = $derived(absoluteUrl('/', page.url.origin));
+  const socialImage = $derived(absoluteUrl(OG_IMAGE_PATH, page.url.origin));
 
   const steps = [
     {
@@ -53,24 +58,34 @@
 <svelte:head>
   <title>Everroot — Discover the tree that holds your story</title>
   <meta name="description" content="Find a tree connected to your story, your traditions, or someone you want to remember. Everroot shows reviewed cultural associations with their sources, and is honest about what is not yet recorded." />
-  <link rel="canonical" href="https://everroot.org/" />
+  <link rel="canonical" href={canonical} />
 
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://everroot.org/" />
+  <meta property="og:url" content={canonical} />
   <meta property="og:title" content="Everroot — Discover the tree that holds your story" />
   <meta property="og:description" content="Find a tree connected to your story, your traditions, or someone you want to remember. Reviewed associations, with the sources attached." />
-  <meta property="og:image" content="https://everroot.org/og-hero.png" />
+  <meta property="og:image" content={socialImage} />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-  <meta property="og:site_name" content="Everroot" />
+  <meta property="og:site_name" content={SITE_NAME} />
 
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:url" content="https://everroot.org/" />
+  <meta name="twitter:url" content={canonical} />
   <meta name="twitter:title" content="Everroot — Discover the tree that holds your story" />
   <meta name="twitter:description" content="Find a tree connected to your story, your traditions, or someone you want to remember." />
 
   <script type="application/ld+json">
-    {"@context":"https://schema.org","@type":"WebSite","name":"Everroot","alternateName":"Everroot — Knowledge with roots","description":"An evidence-led tree discovery portal. Find a tree connected to your story, your traditions, or someone you want to remember, with reviewed cultural sources attached.","url":"https://everroot.org/","inLanguage":"en","publisher":{"@type":"Organization","name":"Everroot","url":"https://everroot.org/"}}
+    {JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'WebSite',
+      name: SITE_NAME,
+      alternateName: SITE_ALTERNATE_NAME,
+      description:
+        'An evidence-led tree discovery portal. Find a tree connected to your story, your traditions, or someone you want to remember, with reviewed cultural sources attached.',
+      url: canonical,
+      inLanguage: 'en',
+      publisher: { '@type': 'Organization', name: SITE_NAME, url: canonical },
+    })}
   </script>
 </svelte:head>
 
