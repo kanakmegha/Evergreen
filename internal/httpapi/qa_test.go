@@ -273,3 +273,97 @@ func TestUnconfiguredAIReportsNotConfigured(t *testing.T) {
 		t.Fatalf("expected a 'not configured' message, got %s", w.Body.String())
 	}
 }
+
+// postQuestion drives the endpoint with a stub answerer and returns the recorder.
+func postQuestion(t *testing.T, answerer questionAnswerer, logw io.Writer) *httptest.ResponseRecorder {
+	t.Helper()
+	api := &API{
+		log: slog.New(slog.NewTextHandler(logw, nil)),
+		mux: http.NewServeMux(),
+		qa:  answerer,
+	}
+	api.routes()
+
+	body, _ := json.Marshal(map[string]any{"question": "Is the neem tree evergreen?"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/questions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.mux.ServeHTTP(w, req)
+	return w
+}
+
+// A busy provider is reported to the caller as 429, so a client knows the
+// request is worth retrying instead of reading a generic outage. The provider's
+// Retry-After is honoured and bounded.
+func TestQuestionOverloadedProviderReturns429WithRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"Model busy, retry later","code":"engine_overloaded"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	t.Setenv("HF_TOKEN", "hf_test_token_not_real")
+	t.Setenv("HF_MODEL_ID", "openai/gpt-oss-120b:cheapest")
+	t.Setenv("HF_BASE_URL", srv.URL)
+	client, err := ai.New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("ai.New: %v", err)
+	}
+
+	var logs bytes.Buffer
+	w := postQuestion(t, client, &logs)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected HTTP 429 for a busy provider, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("expected Retry-After: 1, got %q", got)
+	}
+	if !strings.Contains(w.Body.String(), "busy") {
+		t.Fatalf("expected the caller to be told the service is busy, got %s", w.Body.String())
+	}
+
+	logged := logs.String()
+	for _, want := range []string{"category=rate_limited", "provider_code=engine_overloaded", "status=429", "retryable=true"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("log missing %q: %s", want, logged)
+		}
+	}
+	if strings.Contains(logged, "hf_test_token_not_real") {
+		t.Fatalf("log leaked a credential: %s", logged)
+	}
+}
+
+// A rejected credential is an operator problem, so it stays a 503 and is
+// classified as auth in the log.
+func TestQuestionAuthFailureIsClassified(t *testing.T) {
+	var logs bytes.Buffer
+	w := postQuestion(t, &stubQA{err: ai.ErrUnauthorized}, &logs)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 on an auth failure, got %d", w.Code)
+	}
+	if !strings.Contains(logs.String(), "category=auth") {
+		t.Fatalf("expected an auth classification, got %s", logs.String())
+	}
+}
+
+// An error from outside the AI package is classified but never quoted, so its
+// text (which might contain anything) cannot reach the log.
+func TestQuestionFailureLogIsCredentialFree(t *testing.T) {
+	var logs bytes.Buffer
+	w := postQuestion(t, &stubQA{err: errors.New("boom hf_SUPERSECRET123")}, &logs)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503, got %d", w.Code)
+	}
+	logged := logs.String()
+	if strings.Contains(logged, "hf_SUPERSECRET123") {
+		t.Fatalf("log quoted a foreign error: %s", logged)
+	}
+	if !strings.Contains(logged, "category=unknown") {
+		t.Fatalf("expected an unknown classification, got %s", logged)
+	}
+}

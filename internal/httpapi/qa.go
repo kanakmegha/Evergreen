@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,12 +90,23 @@ func (a *API) askQuestion(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.qa.AnswerQuestion(ctx, input)
 	if err != nil {
-		a.log.Error("AI provider error during question answering",
+		diag := ai.Diagnose(err)
+		// Only the classification is logged, never the raw error string: the
+		// diagnosis is built to contain no credential and no message content.
+		a.log.Error("AI question answering failed",
 			"request_id", r.Header.Get("X-Request-ID"),
-			"error", err,
+			"category", string(diag.Category),
+			"status", diag.Status,
+			"provider_code", diag.ProviderCode,
+			"retryable", diag.Retryable,
+			"detail", diag.Detail,
 		)
 		// Do not silently fall back to database queries; return explicit provider error
-		writeError(w, 503, "The AI service is temporarily unavailable. Please try again.")
+		if diag.RetryAfter > 0 {
+			w.Header().Set("Retry-After", retryAfterSeconds(diag.RetryAfter))
+		}
+		status, message := aiFailureResponse(diag)
+		writeError(w, status, message)
 		return
 	}
 
@@ -210,4 +222,32 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return trimmed
+}
+
+// aiFailureResponse maps an inference diagnosis to a client-facing status and
+// message. A busy provider is reported as 429 so a caller knows to retry;
+// every other provider failure stays a 503, because only the operator can act
+// on it. The message never names a provider, a status, or a token.
+func aiFailureResponse(d ai.Diagnosis) (int, string) {
+	switch d.Category {
+	case ai.CategoryNotConfigured:
+		return http.StatusServiceUnavailable, "The AI question service is not configured. Please ensure HF_TOKEN is set."
+	case ai.CategoryRateLimited:
+		return http.StatusTooManyRequests, "The AI service is busy right now. Please try again in a moment."
+	default:
+		return http.StatusServiceUnavailable, "The AI service is temporarily unavailable. Please try again."
+	}
+}
+
+// retryAfterSeconds renders a Retry-After header value, bounded so a provider
+// cannot park a browser for an unbounded time.
+func retryAfterSeconds(d time.Duration) string {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	if secs > 60 {
+		secs = 60
+	}
+	return strconv.Itoa(secs)
 }

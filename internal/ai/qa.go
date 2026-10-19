@@ -94,7 +94,7 @@ func BuildQuestionPrompt(in QuestionInput) []Message {
 // It does not query PostgreSQL, ensuring question answering works even during a database outage.
 func (c *Client) AnswerQuestion(ctx context.Context, in QuestionInput) (AnswerResult, error) {
 	if c == nil {
-		return AnswerResult{}, errors.New("ai client is not configured")
+		return AnswerResult{}, ErrNotConfigured
 	}
 
 	q := strings.TrimSpace(in.Question)

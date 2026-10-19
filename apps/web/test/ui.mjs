@@ -8,7 +8,10 @@
  * produced by intercepting the API response, which is the only honest way to
  * reach them without inventing database rows.
  *
- * Run with `npm run test:ui`. Requires the API on :8080 and Vite on :5173.
+ * Run with `npm run test:ui`, which starts the Vite dev server, waits until it
+ * actually serves this app, and checks the API on :8080 that the dev server
+ * proxies `/api` to. That API needs a local, migrated database. Set
+ * EVERROOT_WEB_URL (and EVERROOT_API_URL) to reuse servers you already run.
  */
 
 import assert from 'node:assert/strict';
@@ -622,6 +625,115 @@ await edgeState('reference-unavailable', {
     assert.ok((await page.locator('.shortlist__list .opt').count()) >= 1);
   },
 });
+
+/* ------------------------------ discovery catalogue: 404, 503 and recovery */
+
+/**
+ * The catalogue the discovery flow loads at the tradition step. In production
+ * these three calls were landing on the web app itself and returning HTML 404s,
+ * so the states below are the ones a visitor actually met.
+ */
+async function openTraditionStep(page) {
+  await page.goto(`${BASE}/discover?intent=explore`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.step__actions-end button', { timeout: 30000 });
+  await page.locator('.step__actions-end button').last().click();
+}
+
+async function discoveryCatalogue(state, routes) {
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    reducedMotion: 'reduce',
+  });
+  const page = await context.newPage();
+  page.on('pageerror', (error) => consoleErrors.push(`[discovery:${state}] ${error.message}`));
+  const calls = [];
+  await routes(page, calls);
+  await openTraditionStep(page);
+  return { context, page, calls };
+}
+
+await (async () => {
+  const state = 'catalogue-404-then-recovery';
+  const fixture = [{ slug: 'nakshatra-tree-association', name: 'Nakshatra tree association' }];
+  const { context, page, calls } = await discoveryCatalogue(state, async (p, collected) => {
+    // The first attempt fails the way the deployed frontend did: the origin
+    // answers with an HTML page instead of the API. The retry succeeds with a
+    // stubbed body, so the check does not depend on the database.
+    let attempt = 0;
+    await p.route('**/api/v1/traditions', (route) => {
+      attempt += 1;
+      collected.push(route.request().url());
+      if (attempt <= 2) {
+        return route.fulfill({ status: 404, contentType: 'text/html', body: '<!doctype html><h1>404</h1>' });
+      }
+      return json(route, fixture);
+    });
+    await p.route('**/api/v1/nakshatras', (route) => {
+      attempt += 1;
+      if (attempt <= 2) {
+        return route.fulfill({ status: 404, contentType: 'text/html', body: '<!doctype html><h1>404</h1>' });
+      }
+      return json(route, [{ name: 'Rohini', ordinal: 4 }]);
+    });
+  });
+
+  await step(`${state}: a 404 names the configuration instead of an empty catalogue`, async () => {
+    const notice = page.locator('.notice--warn');
+    await notice.waitFor({ state: 'visible', timeout: 20000 });
+    const copy = await notice.innerText();
+    assert.match(copy, /address configured/i);
+    assert.match(copy, /PUBLIC_API_URL/);
+    assert.doesNotMatch(copy, /no traditions|nothing on record/i);
+    assert.equal(await notice.locator('button:has-text("Try again")').count(), 1);
+  });
+
+  await step(`${state}: retrying loads the catalogue again`, async () => {
+    await page.locator('.notice--warn button:has-text("Try again")').click();
+    const cards = page.locator('.choices .choice');
+    await cards.first().waitFor({ state: 'visible', timeout: 20000 });
+    assert.ok((await cards.count()) >= 1, 'the retry must render the traditions');
+    assert.match(await text(page, '.choices'), /Nakshatra/i);
+  });
+
+  await step(`${state}: re-entering the step does not refetch the catalogue`, async () => {
+    const before = calls.length;
+    // Back to the first question through the progress control, then forward
+    // again: the catalogue is already in hand and must not be requested twice.
+    await page.locator('.steps__control').first().click();
+    await page.waitForSelector('.step__actions-end button', { timeout: 20000 });
+    await page.locator('.step__actions-end button').last().click();
+    await page.locator('.choices .choice').first().waitFor({ state: 'visible', timeout: 20000 });
+    await page.waitForTimeout(300);
+    assert.equal(calls.length, before, 'the catalogue request was repeated');
+  });
+
+  await page.screenshot({ path: path.join(SHOTS, `${state}.png`), fullPage: true });
+  await context.close();
+})();
+
+await (async () => {
+  const state = 'catalogue-503-unavailable';
+  const { context, page } = await discoveryCatalogue(state, async (p) => {
+    const body = { error: 'the reviewed catalogue is unavailable right now; please try again shortly' };
+    await p.route('**/api/v1/traditions', (route) => json(route, body, 503));
+    await p.route('**/api/v1/nakshatras', (route) => json(route, body, 503));
+  });
+
+  await step(`${state}: an unavailable catalogue is reported as unavailable, not as missing`, async () => {
+    const notice = page.locator('.notice--warn');
+    await notice.waitFor({ state: 'visible', timeout: 20000 });
+    const copy = await notice.innerText();
+    assert.match(copy, /503/);
+    assert.match(copy, /unavailable/i);
+    // This is a database problem, not a misconfigured origin.
+    assert.doesNotMatch(copy, /PUBLIC_API_URL/);
+    assert.doesNotMatch(copy, /no traditions|nothing on record/i);
+    assert.equal(await page.locator('.choices .choice').count(), 0);
+  });
+
+  await page.screenshot({ path: path.join(SHOTS, `${state}.png`), fullPage: true });
+  await context.close();
+})();
 
 await browser.close();
 

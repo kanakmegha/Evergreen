@@ -3,7 +3,6 @@ package ai
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 )
 
@@ -88,7 +87,7 @@ Hard rules:
 // caller can distinguish a provider failure from an empty dataset.
 func (c *Client) Explain(ctx context.Context, in ExplainInput) (ExplainResult, error) {
 	if c == nil {
-		return ExplainResult{}, errors.New("ai client is not configured")
+		return ExplainResult{}, ErrNotConfigured
 	}
 	payload, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {

@@ -11,6 +11,8 @@
  * the browser. Only `tradition`, `region` and `nakshatra` are ever sent.
  */
 
+import { apiSameOriginSetting, apiURLSetting, developmentBuild } from './apiEnv';
+
 export type IntentionId =
   | 'personal'
   | 'remember'
@@ -221,37 +223,169 @@ export function joinAPIBase(base: string, path: string): string {
 }
 
 /**
- * apiURL is the single helper every API call goes through.
- *
- * PUBLIC_API_URL is inlined at build time. It is only needed when the API is
- * served from a different origin than the web app; when it is unset, requests
- * stay relative and are proxied by the development server or the platform.
- * Setting it requires WEB_ORIGIN on the API to name this app's origin, because
- * a cross-origin call is refused without it.
+ * What the interface says when the deployment names no API address. It is
+ * exported so the tests pin the exact promise made to the operator.
  */
-export function apiURL(path: string): string {
-  const env = typeof import.meta !== 'undefined' ? (import.meta as any).env : undefined;
-  const configured = env?.PUBLIC_API_URL;
-  return joinAPIBase(configured ? String(configured) : '', path);
+export const API_CONFIGURATION_ERROR =
+  'This deployment has no catalogue API address configured, so the request was not sent. Set PUBLIC_API_URL to the backend origin and redeploy. If the API really is served from this same origin, set PUBLIC_API_SAME_ORIGIN=true instead.';
+
+/**
+ * apiBase is the configured backend origin, or an empty string when the build
+ * had none.
+ *
+ * `PUBLIC_API_URL` reaches the bundle through SvelteKit's `$env/static/public`
+ * (see `apiEnv.ts`), which is inlined at build time and does not depend on
+ * Vite's `envPrefix`. It is only needed when the API is served from a different
+ * origin than the web app. Setting it requires `WEB_ORIGIN` on the API to name
+ * this app's origin, because a cross-origin call is refused without it.
+ */
+export function apiBase(): string {
+  return String(apiURLSetting ?? '').trim().replace(/\/+$/, '');
 }
 
-async function getJSON<T>(url: string): Promise<T> {
-  const res = await fetch(apiURL(url), { headers: { accept: 'application/json' } });
-  if (!res.ok) throw new Error(`Request failed (${res.status})`);
+/** True when this build names a backend origin. */
+export function isAPIConfigured(): boolean {
+  return apiBase() !== '';
+}
+
+/**
+ * Whether a same-origin request is acceptable.
+ *
+ * Under `vite dev` the dev server proxies `/api`, so it always is. A production
+ * build has to say so explicitly with `PUBLIC_API_SAME_ORIGIN=true`, because
+ * otherwise a missing `PUBLIC_API_URL` quietly turns every catalogue call into a
+ * request to the web app's own origin — which serves no API and answers with an
+ * HTML 404. That silent fallback is exactly what made the original
+ * misconfiguration so hard to see, so it is no longer the default.
+ *
+ * Pure so both deployment models can be tested without a bundler.
+ */
+export function sameOriginAllowed(
+  development: boolean,
+  sameOriginSetting: string | undefined
+): boolean {
+  return development || String(sameOriginSetting ?? '').trim().toLowerCase() === 'true';
+}
+
+/** The reason no catalogue request may be made, or null when one may. */
+export function missingAPIConfiguration(): string | null {
+  if (isAPIConfigured() || sameOriginAllowed(developmentBuild, apiSameOriginSetting)) return null;
+  return API_CONFIGURATION_ERROR;
+}
+
+/**
+ * apiURL is the single helper every API call goes through. The base is a
+ * parameter so the joining rules can be tested against a configured origin
+ * without a bundler; every caller uses the build-time default.
+ */
+export function apiURL(path: string, base: string = apiBase()): string {
+  return joinAPIBase(base, path);
+}
+
+/**
+ * The distinctions the interface has to make. A 404 means the origin that
+ * answered serves no API at this path (a routing or configuration problem); a
+ * 503 means the API answered but cannot serve its reviewed records; a transport
+ * failure means the API was never reached. None of them is "no records", so
+ * none of them may be presented as one.
+ */
+export type APIErrorKind =
+  | 'config'
+  | 'not_found'
+  | 'unavailable'
+  | 'server'
+  | 'request'
+  | 'network';
+
+export class APIError extends Error {
+  readonly kind: APIErrorKind;
+  readonly status: number | null;
+
+  constructor(kind: APIErrorKind, message: string, status: number | null = null) {
+    super(message);
+    this.name = 'APIError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/** Map an HTTP status to the one distinction the interface needs. */
+export function classifyStatus(status: number): APIErrorKind {
+  if (status === 404) return 'not_found';
+  if (status === 503) return 'unavailable';
+  if (status >= 500) return 'server';
+  return 'request';
+}
+
+/**
+ * Honest copy for an API failure.
+ *
+ * A 404 in a build that named no backend origin is a configuration problem: the
+ * request could only have gone to the web app's own origin, which serves no
+ * API, and the copy says so and names PUBLIC_API_URL. Everything else is
+ * reported as itself, so a visitor is never told the catalogue is empty. The
+ * `configured` flag is a parameter so every branch is testable without a
+ * build-time value.
+ */
+export function apiErrorMessage(error: unknown, configured: boolean = isAPIConfigured()): string {
+  const kind = error instanceof APIError ? error.kind : 'network';
+  const status = error instanceof APIError ? error.status : null;
+
+  if (!configured && kind === 'not_found') {
+    return 'This build has no catalogue API address configured, so the request went to this site’s own origin and was not found. Set PUBLIC_API_URL to the backend origin and redeploy.';
+  }
+
+  switch (kind) {
+    case 'config':
+      return API_CONFIGURATION_ERROR;
+    case 'not_found':
+      return 'The catalogue API was not found at the configured address (404). Check that PUBLIC_API_URL names the backend origin.';
+    case 'unavailable':
+      return 'The reviewed catalogue is unavailable right now (503). The API answered, but its reviewed records cannot be served yet — please try again shortly.';
+    case 'server':
+      return `The catalogue API reported a server error (${status ?? 500}). Please try again shortly.`;
+    case 'request':
+      return `The catalogue API rejected the request (${status ?? 400}).`;
+    default:
+      return 'The catalogue API could not be reached. Check your connection and try again.';
+  }
+}
+
+async function getJSON<T>(path: string, base: string = apiBase()): Promise<T> {
+  const origin = String(base ?? '').trim().replace(/\/+$/, '');
+  if (!origin) {
+    // A production build that names no API address must not quietly send the
+    // request to this site's own origin. That is a configuration error, and the
+    // caller is told so — with nothing sent — instead of being shown an HTML 404
+    // that looks like a missing catalogue.
+    const misconfigured = missingAPIConfiguration();
+    if (misconfigured) throw new APIError('config', misconfigured);
+  }
+  const url = apiURL(path, origin);
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { accept: 'application/json' } });
+  } catch {
+    throw new APIError('network', `The request to ${url} failed before a response was received.`);
+  }
+  if (!res.ok) {
+    throw new APIError(classifyStatus(res.status), `Request failed (${res.status})`, res.status);
+  }
   return (await res.json()) as T;
 }
 
-export function fetchTraditions(): Promise<Tradition[]> {
-  return getJSON<Tradition[]>('/api/v1/traditions');
+export function fetchTraditions(base: string = apiBase()): Promise<Tradition[]> {
+  return getJSON<Tradition[]>('/api/v1/traditions', base);
 }
 
-export function fetchNakshatras(): Promise<Nakshatra[]> {
-  return getJSON<Nakshatra[]>('/api/v1/nakshatras');
+export function fetchNakshatras(base: string = apiBase()): Promise<Nakshatra[]> {
+  return getJSON<Nakshatra[]>('/api/v1/nakshatras', base);
 }
 
-export function fetchRegions(traditionSlug: string): Promise<string[]> {
+export function fetchRegions(traditionSlug: string, base: string = apiBase()): Promise<string[]> {
   return getJSON<string[]>(
-    `/api/v1/traditions/${encodeURIComponent(traditionSlug)}/regions`
+    `/api/v1/traditions/${encodeURIComponent(traditionSlug)}/regions`,
+    base
   );
 }
 

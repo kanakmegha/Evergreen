@@ -160,11 +160,48 @@ The backend is a listening HTTP server, not a serverless function. It reads the 
 | `DIRECT_URL` | — | No | The **direct** (unpooled) endpoint. Used only by `cmd/migrate`, never by the server, because the migration runner holds a session-level advisory lock. |
 | `DATABASE_CONNECT_TIMEOUT` | Backend | No | Bound on one connection attempt (default `10s`). Raise it if Neon cold starts exceed the default. |
 | `HF_TOKEN` | Backend | To answer questions | Hugging Face credentials. Never commit it, and never expose it to the browser. |
-| `HF_MODEL_ID`, `HF_BASE_URL` | Backend | No | Optional provider overrides. |
+| `HF_MODEL_ID`, `HF_BASE_URL` | Backend | No | Optional provider overrides. Leave `HF_MODEL_ID` unset to use the default, un-suffixed identifier; a provider or policy suffix such as `:cheapest` pins one provider and gives up the router's automatic failover. |
 | `WEB_ORIGIN` | Backend | Only for a split origin | Comma-separated list of web origins allowed to call this API. See below. |
-| `PUBLIC_API_URL` | Frontend | Only for a split origin | The backend origin, for example `https://everroot-api.example`. Must be set at **build** time. |
+| `PUBLIC_API_URL` | Frontend | For a split origin | The backend origin, for example `https://everroot-api.example`. Read through SvelteKit's `$env/static/public` and inlined at **build** time. A production build without it (and without the opt-in below) refuses to send catalogue requests and reports a configuration error. |
+| `PUBLIC_API_SAME_ORIGIN` | Frontend | Only for a single-origin deployment | Set to `true` when the API really is served from the same origin as the web app. This is automatic under `vite dev`; a production build needs this opt-in before it will send same-origin requests with no `PUBLIC_API_URL`. |
 | `PUBLIC_SITE_URL` | Frontend | Before launch | The public origin used for canonical links, `robots.txt` and `sitemap.xml`. |
 | `API_ADDR` | — | No | Local development only. Do not set it on a platform that provides `PORT`. |
+
+### If the catalogue returns 404 in the browser
+
+A **404** and a **503** are different failures, and the interface says which one happened.
+
+A 404 on `/api/v1/…` means the request went to the *web app's* own origin — for example `https://<web-project>.vercel.app/api/v1/nakshatras` — and was answered by SvelteKit's catch-all HTML page. That origin serves no API: the frontend and the backend are two Vercel projects here, and the frontend project's root is `apps/web`, so it never sees the root `vercel.json` rewrites.
+
+`PUBLIC_API_URL` is what prevents that. It is read in `apps/web/src/lib/apiEnv.ts` through SvelteKit's `$env/static/public`, and inlined into the client bundle at build time. Two consequences matter:
+
+- **The variable has to exist when the frontend is built.** Changing it later, or setting it on the wrong project or environment, does not change a bundle that is already deployed; the frontend must be redeployed.
+- **A production build with no address configured no longer sends a same-origin request.** `getJSON()` in `apps/web/src/lib/discovery.ts` refuses before calling `fetch`, and the interface names `PUBLIC_API_URL`. Set it to the backend origin, or set `PUBLIC_API_SAME_ORIGIN=true` if the API truly shares this origin.
+
+Earlier revisions read `import.meta.env.PUBLIC_API_URL` instead. That resolved only while `vite.config.ts` carried a hand-written `envPrefix: ['VITE_', 'PUBLIC_']`; SvelteKit's own types note that Vite's `envPrefix` must be set separately for Vite's environment handling and that using that feature is generally unnecessary. Remove or reorder the option and the origin silently became `undefined`, the app fell back to same-origin requests, and the problem showed up only as HTML 404s in a browser. The `$env/static/public` read does not depend on `envPrefix`, and the option has been removed.
+
+To verify a deployed build without changing anything:
+
+```sh
+node -e '(async () => {
+  const base = process.argv[1];
+  const seen = new Set(), queue = [];
+  const add = (ref, from) => { try { const u = new URL(ref, from); if (u.origin === base) queue.push(u.href); } catch {} };
+  const html = await (await fetch(base + "/discover")).text();
+  for (const m of html.matchAll(/\/_app\/immutable\/[A-Za-z0-9._\/-]+\.js/g)) add(m[0], base + "/");
+  while (queue.length && seen.size < 80) {
+    const url = queue.shift();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const text = await (await fetch(url)).text();
+    if (text.includes("evergreen-backend-eight")) return console.log("origin present in", url);
+    for (const m of text.matchAll(/["\x27`(]([A-Za-z0-9._\/-]+\.js)["\x27`)]/g)) add(m[1], url);
+  }
+  console.log("ORIGIN ABSENT from the client bundle");
+})()' https://<web-project>.vercel.app
+```
+
+Then in DevTools → Network, reload `/discover` and walk to the tradition step: the three catalogue requests must show the backend hostname. If they do, the routing is correct and the only remaining failure is the 503 below — the API is reached, but the reviewed records cannot be served. That is a database state, not a routing one.
 
 ### If the reviewed catalogue returns 503
 
@@ -189,6 +226,26 @@ A 503 is a database problem, not a code problem, but "the database" covers sever
 Connection and schema are different failures. `Ping` succeeds against a reachable, authenticated database even when it is empty, so a missing schema never appears as "the database is unreachable". The backend logs the target (host, port, database, user, and whether a password is set — never the password itself) and the classification.
 
 `/healthz` returns 200 whenever the process is up; `/readyz` returns 503 when PostgreSQL cannot be reached at all. That separates "the API is running" from "the database answers".
+
+### If an AI question returns 429 or 503
+
+`/api/v1/questions` and `/api/v1/explain` answer from the model alone: they never read PostgreSQL, so a database outage never turns an AI answer into a failure, and a failed interaction save is logged and ignored.
+
+A provider failure is classified like a database failure, and only the classification is logged — never the token, the prompt, or the provider's response body:
+
+| `category` | HTTP | Meaning | Fix |
+| --- | --- | --- | --- |
+| `not_configured` | 503 | `HF_TOKEN` is unset | Set it on the backend project |
+| `auth` | 503 | The provider rejected the credentials | Re-issue `HF_TOKEN` with the *Inference Providers* permission |
+| `credits` | 503 | The account cannot pay for the selected provider | Enable billing, or pick a different provider |
+| `rate_limited` | 429 | The provider is busy or throttling (for example `provider_code=engine_overloaded`) | Nothing: the request is retried, and a `Retry-After` header is returned |
+| `provider_error` | 503 | A 5xx from the provider, or a transport failure | Retry; the log records the status |
+| `timeout` | 503 | No answer within the per-attempt deadline | Retry |
+| `no_completion`, `bad_response` | 503 | The provider replied without any usable text | Retry; if it recurs the model may not be a chat model |
+
+Transient failures (an overloaded model, a 5xx, a timeout) are retried up to three times. Each retry drops any routing suffix from the model so the router can fail over to a different provider, which is why a pinned `:cheapest` value still recovers. Authentication and billing failures are never retried: waiting cannot fix them.
+
+A model identifier carrying a provider or policy suffix (`openai/gpt-oss-120b:cheapest`) pins inference to a single provider and gives up the router's automatic failover, so that provider's overload becomes a 429 for every visitor. The default, un-suffixed identifier is the more reliable choice.
 
 The server binds its listener and starts answering **before** it tests the database, and it keeps the pool open when that first test fails. pgxpool connects lazily, so a Neon compute that is still waking serves the next request normally; discarding the pool on the first failed ping would turn a temporary outage into a permanent one.
 
@@ -222,11 +279,11 @@ When the frontend and backend are on different domains, set `PUBLIC_API_URL` on 
 
 `WEB_ORIGIN` is an exact, comma-separated allow-list. Cross-origin access is opt-in and there is no wildcard — this API spends a paid model call on `/api/v1/questions`, so reflecting an arbitrary `Origin` would let any site spend someone else's quota. A missing `WEB_ORIGIN` grants nothing, and preflight requests are answered only for listed origins.
 
-`PUBLIC_API_URL` is inlined into the browser bundle at build time, so changing it requires a new frontend deployment; it cannot be changed at runtime.
+`PUBLIC_API_URL` is read through SvelteKit's `$env/static/public` and inlined into the browser bundle at build time, so changing it requires a new frontend deployment; it cannot be changed at runtime. Set it for every environment that should work: a Preview build without it reports a configuration error rather than calling the preview origin.
 
 ### Cross-origin access on one origin
 
-If both are served from one domain, leave `PUBLIC_API_URL` and `WEB_ORIGIN` unset and let requests stay relative. Vite proxies `/api` during development; on Vercel, the root `vercel.json` routes `/api/(.*)`, `/internal/(.*)`, `/healthz` and `/readyz` to the API service.
+If both are served from one domain, set `PUBLIC_API_SAME_ORIGIN=true` on the frontend and leave `WEB_ORIGIN` unset. Requests stay relative: Vite proxies `/api` during development (where the opt-in is automatic), and on Vercel the root `vercel.json` routes `/api/(.*)`, `/internal/(.*)`, `/healthz` and `/readyz` to the API service. The opt-in is explicit because a missing `PUBLIC_API_URL` used to fall back to same-origin requests silently, which is indistinguishable, in the browser, from a correct deployment.
 
 `PUBLIC_`-prefixed variables are inlined into the browser bundle by design. Never put a secret behind that prefix.
 
@@ -235,7 +292,7 @@ If both are served from one domain, leave `PUBLIC_API_URL` and `WEB_ORIGIN` unse
 1. Apply migrations to the database (manual, once per schema change). Verify with `go run ./cmd/dbcheck DIRECT_URL` — it must report `reachable=true schema_present=true`.
 2. Deploy the backend, with `DATABASE_URL`, `HF_TOKEN` and (for split origins) `WEB_ORIGIN` set. Remove any `API_ADDR` left over from local development.
 3. Verify the backend directly: `/healthz` should be 200, `/readyz` 200, and `/api/v1/nakshatras` should be 200 with 27 entries (not 503, not 500). If a catalogue endpoint returns 503, the log line names the `category`; see *If the reviewed catalogue returns 503* above.
-4. Set `PUBLIC_API_URL` on the frontend if the origins differ.
+4. Set `PUBLIC_API_URL` on the frontend if the origins differ, or `PUBLIC_API_SAME_ORIGIN=true` for a production single-origin deployment.
 5. Deploy the frontend last, so the build picks up `PUBLIC_API_URL`.
 
 

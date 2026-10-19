@@ -10,6 +10,7 @@
     FOLLOW_UPS,
     INTENTIONS,
     NAKSHATRA_TRADITION,
+    apiErrorMessage,
     clearFlow,
     emptyAnswers,
     fetchNakshatras,
@@ -213,8 +214,10 @@
       nakshatras = n;
       catalogState = 'ready';
     } catch (error) {
-      catalogError =
-        error instanceof Error ? error.message : 'The catalogue could not be loaded.';
+      // The message distinguishes a 404 (no API at the configured address), a
+      // 503 (API up, reviewed records unavailable) and a transport or
+      // configuration failure. It never says the catalogue is empty.
+      catalogError = apiErrorMessage(error);
       catalogState = 'error';
     }
   }
@@ -224,13 +227,22 @@
     await ensureCatalog();
   }
 
+  // The region list only narrows the query and is optional, so a failure is
+  // shown as "any region" rather than as an error. `regionsFor` remembers which
+  // tradition the list belongs to so re-entering this step (Back, forward, a
+  // progress click) does not repeat the request. A failure is not remembered,
+  // so returning to the step retries instead of hiding an outage all visit.
+  let regionsFor = '';
+
   async function loadRegions() {
     const slug = answers.tradition;
-    if (!slug) return;
+    if (!slug || regionsFor === slug) return;
     try {
       regions = await fetchRegions(slug);
+      regionsFor = slug;
     } catch {
       regions = [];
+      regionsFor = '';
     }
   }
 
