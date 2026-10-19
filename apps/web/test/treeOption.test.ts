@@ -141,7 +141,7 @@ test('a reference record carries no cultural claim and labels itself honestly', 
     { text: 'Botanical record', tone: 'neutral' },
     { text: 'accepted name', tone: 'neutral' },
   ]);
-  assert.equal(option.culturalNote, 'Checked against Everroot’s reviewed cultural dataset: no record for this selection.');
+  assert.equal(option.culturalNote, 'Everroot holds no reviewed record for this combination yet, so nothing cultural is claimed either way.');
   // The rule is a statement about ordering, never a claim about the visitor.
   assert.equal(option.whyIncluded, REFERENCE_RULE);
   assert.deepEqual(option.gaps, REFERENCE_GAPS);
@@ -275,8 +275,8 @@ test('catalogue rows are marked as already being in the shortlist', () => {
 /* -------------------------------------------- cultural note and honesty */
 
 test('the cultural note follows the publication gate, not a guess', () => {
-  assert.match(culturalNote(false, 'no_reviewed_match'), /no record for this selection/);
-  assert.match(culturalNote(false, 'not_queryable'), /no cultural match was checked/);
+  assert.match(culturalNote(false, 'no_reviewed_match'), /no reviewed record for this combination/);
+  assert.match(culturalNote(false, 'not_queryable'), /no cultural record to look up/);
   assert.match(culturalNote(false, ''), /has not verified/);
   assert.match(culturalNote(true, 'reviewed_match'), /Reviewed and published/);
 });

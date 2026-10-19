@@ -141,6 +141,29 @@ The question prompt carries the same rule as the rest of Everroot: the model mus
 
 Feedback is posted to `POST /api/v1/feedback` and is independent of answer generation.
 
+### Suggesting trees
+
+`POST /api/v1/recommendations` is the AI-first half of discovery: it draws tree suggestions for one visitor's answers, whatever intention they chose. The request path is the same shape as the question path — the browser posts the selections and the words the visitor wrote, the API validates them, builds the prompt (`internal/ai/recommend.go`), calls the configured model, then validates the reply before returning it. A candidate without a name or without a reason is dropped rather than repaired, and a reply Everroot cannot read is reported as **502**, never as an empty list.
+
+Two properties are deliberate:
+
+- **It consults neither the database nor the botanical catalogue.** A suggestion arrives even when the catalogue is 503 or empty, which is what makes discovery independent of a migration. The only part that touches reviewed data is `evidence.culturalAssociation`, and it goes through the same publication gate as `/api/v1/discoveries` and `/api/v1/explain`.
+- **It is separate from `POST /api/v1/discoveries`.** That endpoint answers "is there a reviewed cultural association for this selection?" and can only ever return what a reviewer approved. This one answers "what else might fit?", and is labelled as machine-written wherever it appears. Neither can borrow the other's authority.
+
+Failures are reported as failures: **503** when the AI layer is not configured or unreachable, **429** (with `Retry-After`) when the model is busy, **502** when the reply cannot be read. A 200 with an empty list means one thing only — the model found nothing it would stand behind — and the interface says exactly that instead of showing a blank shortlist.
+
+The visitor's own words do travel in this request, because a suggestion cannot be drawn from closed vocabularies alone. They are used to build one prompt and are never written to PostgreSQL or to the log; the follow-up step says so at the field where the note is written.
+
+Three optional things may come back with the suggestions, and each one is bounded by a rule rather than by trust:
+
+- **`matureSize`** is the typical mature height the model offers alongside its growing requirements and limitations. Where it is not sure, it writes "not sure" rather than inventing a figure.
+- **`followUpQuestion`** is present only when one missing fact would materially change the recommendations. It is omitted when absent, and it never stands in for an answer: the suggestions arrive with it, in the same reply, so asking costs nothing extra and delays nothing.
+- **`culturalNote`** is the one place the model may mention cultural associations at all, and it may only restate a verdict it did not choose. The server computes `evidence.culturalAssociation` from the same publication gate as every other endpoint and hands the model exactly one value of it — `no_reviewed_match`, the case where a visitor asked about a tradition and Nakshatra and Everroot has no reviewed record to answer with. In that case the model writes one plain sentence saying so; otherwise it is told to say nothing about cultural associations, not even to deny one. The note describes the record, never the tree: no tree is or is not associated with a nakshatra because a suggestion was drawn. A verified match, and a selection nobody made, are stated by the server and never by the model.
+
+The results page renders the follow-up question as a question, not as a placeholder for a second visit: "Change my answers" is how a visitor answers it, and there is no second model call.
+
+The results page asks for suggestions first and falls back to the explanation call only when none arrive, so a results view costs at most one model call either way.
+
 ## Deploying
 
 The project deploys as two Vercel projects from this one repository:
@@ -301,7 +324,7 @@ If both are served from one domain, set `PUBLIC_API_SAME_ORIGIN=true` on the fro
 - No real cultural sources or mappings have been imported; only catalog selectors exist. The public cultural path therefore has no data behind it yet.
 - No external identity provider is integrated. The review workflow is for trusted localhost development only.
 - No birth-date/time calculations, accounts, save/share, planting partners, analytics, or marketing are included.
-- `POST /api/v1/questions` answers from general model knowledge. It is deliberately not treated as evidence, and nothing it returns is stored as a reviewed record.
+- `POST /api/v1/questions` answers from general model knowledge, and `POST /api/v1/recommendations` draws its suggestions the same way. Neither is treated as evidence: nothing either returns is stored as a reviewed record, and a suggestion never states a cultural association. Suggestions are also not checked against the authority catalogue, so a suggested name is the model's own until someone opens the tree reference.
 - Interaction and feedback retention is unmanaged: `user_interactions` and `user_feedback` have no automatic expiry. Add a retention and deletion policy before collecting real user questions.
 - Source metadata is entered and reviewed, but external link rot and licence interpretation still require human follow-up.
 - API throttling, production secrets, backup policy, and external security review remain future work.

@@ -12,14 +12,42 @@ import (
 	"everroot/internal/dbhealth"
 )
 
-// /api/v1/explain and /api/v1/questions answer inside the request, so the write
-// deadline has to outlast a single inference round trip. Before this guard the
-// server allowed 15s while the provider client allowed 25s, and a slow answer
-// was killed mid-flight: the browser received an aborted connection (HTTP 000)
-// rather than a response.
+// The AI-backed endpoints answer inside the request, so the write deadline has
+// to outlast the provider's whole worst case, not one round trip. Before this
+// guard the server allowed 15s while the provider client allowed 25s, and a
+// slow answer was killed mid-flight: the browser received an aborted connection
+// (HTTP 000) rather than a response.
+//
+// The second half of the guard is the same failure one level up. The deadline
+// was measured against a single ProviderTimeout, but the client retries a
+// transient failure, so an attempt that timed out and then succeeded ran past
+// the deadline and the connection was cut anyway. The visitor was told the
+// service could not be reached for a call that had been working the whole
+// time, which is worse than a slow answer because it is untrue.
 func TestWriteTimeoutExceedsProviderTimeout(t *testing.T) {
 	if writeTimeout() <= ai.ProviderTimeout {
 		t.Fatalf("write timeout %s must exceed the provider timeout %s", writeTimeout(), ai.ProviderTimeout)
+	}
+	if writeTimeout() <= ai.WorstCaseResponseTime {
+		t.Fatalf(
+			"write timeout %s must exceed the provider worst case %s, or a retry that succeeds is killed mid-answer",
+			writeTimeout(), ai.WorstCaseResponseTime,
+		)
+	}
+}
+
+// The worst case is spelled out rather than trusted, so that raising the
+// attempt count or the per-attempt timeout cannot quietly leave the server
+// deadline behind.
+func TestWorstCaseCoversEveryAttemptAndBackoff(t *testing.T) {
+	const attempts = 3
+	const backoff = 2 * time.Second
+	want := attempts*ai.ProviderTimeout + (attempts-1)*backoff
+	if ai.WorstCaseResponseTime < want {
+		t.Fatalf("worst case %s is shorter than %d attempts with backoff %s (%s)", ai.WorstCaseResponseTime, attempts, backoff, want)
+	}
+	if ai.WorstCaseResponseTime <= ai.ProviderTimeout {
+		t.Fatalf("worst case %s must be more than one attempt %s", ai.WorstCaseResponseTime, ai.ProviderTimeout)
 	}
 }
 

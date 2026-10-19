@@ -214,6 +214,20 @@ fs.mkdirSync(SHOTS, { recursive: true });
 
 const browser = await chromium.launch();
 const consoleErrors = [];
+/**
+ * Console errors are fatal, and they are how a broken origin or a broken asset
+ * reached production last time.
+ *
+ * Exactly one condition is exempt, and it is an environment condition rather
+ * than an application fault: the suggestion service answering 503. This suite
+ * runs the API with no HF_TOKEN, so that request is expected to fail here — and
+ * only here. It is recorded and printed rather than hidden, and the checks
+ * themselves assert what the page does with the failure.
+ */
+const toleratedErrors = [];
+function toleratedConsoleError(text, url) {
+  return /status of 503/.test(text) && /\/api\/v1\/recommendations/.test(url);
+}
 
 for (const vp of VIEWPORTS) {
   const context = await browser.newContext({
@@ -222,7 +236,13 @@ for (const vp of VIEWPORTS) {
   });
   const page = await context.newPage();
   page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(`[${vp.name}] ${message.text()}`);
+    if (message.type() !== 'error') return;
+    const url = message.location()?.url ?? '';
+    if (toleratedConsoleError(message.text(), url)) {
+      toleratedErrors.push(`[${vp.name}] ${message.text()} (${url})`);
+      return;
+    }
+    consoleErrors.push(`[${vp.name}] ${message.text()}`);
   });
   page.on('pageerror', (error) => consoleErrors.push(`[${vp.name}] ${error.message}`));
 
@@ -502,6 +522,29 @@ async function edgeState(name, { setup, check }) {
   });
   const page = await context.newPage();
   page.on('pageerror', (error) => consoleErrors.push(`[edge:${name}] ${error.message}`));
+  // The page asks for suggestions before it falls back to the botanical
+  // reference, and this suite runs against a live API. A state built by
+  // intercepting explain/trees would otherwise be taken over by whatever the
+  // provider happens to suggest at that moment — a passing check that was only
+  // ever passing because the provider happened to be off. Registered before
+  // setup so a test that does want suggestions can override it.
+  await page.route('**/api/v1/recommendations', (route) =>
+    json(route, {
+      status: 'no_suggestions',
+      suggestions: [],
+      evidence: {
+        culturalAssociation: 'not_queryable',
+        botanicalIdentity: 'unavailable',
+        habitat: 'no_reviewed_record',
+        ecologicalRole: 'no_reviewed_record',
+        documentedStories: 'no_reviewed_record',
+        personalMeaning: 'user_owned',
+      },
+      promptVersion: 'stub',
+      model: 'stub-model',
+      disclaimer: 'Stubbed for this check.',
+    })
+  );
   await setup(page);
   await seedRecord(page);
   await step(`edge: ${name}`, async () => {
@@ -543,7 +586,7 @@ await edgeState('provider-error-keeps-the-shortlist', {
     assert.match(note, /provider|unavailable|reach/i);
     // A provider failure must never be reported as missing cultural data.
     const body = await page.locator('body').innerText();
-    assert.doesNotMatch(note, /no record for this selection/);
+    assert.doesNotMatch(note, /no reviewed record for this combination|no record for this selection/);
     assert.equal(body.split('not Nakshatra recommendations').length - 1, 1);
   },
 });
@@ -616,7 +659,12 @@ await edgeState('reference-unavailable', {
     );
   },
   check: async (page) => {
-    assert.match(await text(page, '.cat__toggle-meta'), /0 available/);
+    // An unreadable reference is not an empty one. Reporting it as "0 available"
+    // would state a failure as a fact about Everroot's records, which is how the
+    // production 503 read as "Everroot has nothing".
+    const meta = await text(page, '.cat__toggle-meta');
+    assert.match(meta, /unavailable/);
+    assert.doesNotMatch(meta, /0 available/);
     await page.locator('.cat__toggle').click();
     await page.locator('#catalogue-panel').waitFor({ state: 'visible' });
     assert.match(await text(page, '.cat__panel'), /temporarily unavailable/);
@@ -626,7 +674,249 @@ await edgeState('reference-unavailable', {
   },
 });
 
+/**
+ * The AI-first path: suggestions drawn from the visitor's answers, with no
+ * verified cultural record behind them. Two things have to be true at once —
+ * the shortlist must be filled by the model rather than by the catalogue, and
+ * nothing on the page may let a generated idea read as a reviewed record.
+ */
+await edgeState('ai-suggestions-are-labelled-as-generated', {
+  setup: async (page) => {
+    await page.route('**/api/v1/recommendations', (route) =>
+      json(route, {
+        status: 'ok',
+        suggestions: [
+          {
+            name: 'Neem',
+            scientificName: 'Azadirachta indica',
+            whyItMatches: 'It suits the courtyard you wrote about, and it asks for little care.',
+            botanicalDetail: 'A tree in the mahogany family, native to the Indian subcontinent.',
+            growingRequirements: ['Full sun', 'Deep soil'],
+            limitations: ['Fast surface roots'],
+          },
+          {
+            name: 'Jamun',
+            scientificName: 'Syzygium cumini',
+            whyItMatches: 'A long-lived tree for a place that matters to you.',
+            botanicalDetail: 'A tree in the myrtle family, native to the Indian subcontinent.',
+            growingRequirements: ['Moist soil'],
+            limitations: [],
+          },
+        ],
+        evidence: {
+          culturalAssociation: 'no_reviewed_match',
+          botanicalIdentity: 'unavailable',
+          habitat: 'no_reviewed_record',
+          ecologicalRole: 'no_reviewed_record',
+          documentedStories: 'no_reviewed_record',
+          personalMeaning: 'user_owned',
+        },
+        promptVersion: 'v1.0-structured-suggestions',
+        model: 'stub-model',
+        disclaimer: 'Machine-written.',
+      })
+    );
+  },
+  check: async (page) => {
+    assert.equal(await page.locator('.shortlist__list .opt').count(), 2);
+
+    // Every card leads with what it is.
+    const tags = page.locator('.shortlist__list .opt .tag');
+    assert.match(await tags.first().innerText(), /AI-generated suggestion/);
+    assert.equal(await tags.count(), 2);
+
+    // What the visitor wrote is what it answered.
+    assert.match(await text(page, '.summary__lede'), /suggested from your answers/);
+    assert.doesNotMatch(await text(page, '.summary__lede'), /Rather than guess/);
+    assert.match(await text(page, 'body'), /Botanical records only/);
+
+    // The note says where the text came from, in full: written for this
+    // visitor's answers, with no reviewed record behind it — and it says so
+    // without arguing with the tradition they chose.
+    const note = await text(page, '.note');
+    assert.match(note, /Chosen for you from your answers/);
+    assert.match(note, /not read from a reviewed record/);
+    assert.match(note, /no citation behind these/);
+    assert.doesNotMatch(note, /never a cultural association/);
+
+    // Opening a card keeps the same promises in place.
+    await page.locator('.shortlist__list .opt button:has-text("Explore this tree")').first().click();
+    await page.waitForSelector('.shortlist__list .opt__more');
+    const card = await page.locator('.shortlist__list .opt').first().innerText();
+    assert.match(card, /Source — none/);
+    assert.match(card, /Full sun/);
+    assert.match(card, /Fast surface roots/);
+  },
+});
+
+/**
+ * A model that finds nothing says so, and the page explains it instead of
+ * presenting a silent shortlist. This is the honest empty state: distinct from
+ * an outage, and never dressed as one.
+ */
+await edgeState('ai-suggestions-no-genuine-fit', {
+  setup: async (page) => {
+    await page.route('**/api/v1/recommendations', (route) =>
+      json(route, {
+        status: 'no_suggestions',
+        suggestions: [],
+        evidence: {
+          culturalAssociation: 'not_queryable',
+          botanicalIdentity: 'unavailable',
+          habitat: 'no_reviewed_record',
+          ecologicalRole: 'no_reviewed_record',
+          documentedStories: 'no_reviewed_record',
+          personalMeaning: 'user_owned',
+        },
+        promptVersion: 'v1.0-structured-suggestions',
+        model: 'stub-model',
+        disclaimer: 'Machine-written.',
+      })
+    );
+  },
+  check: async (page) => {
+    // The reference shortlist still fills the page, so a "no fit" is never a blank.
+    assert.ok((await page.locator('.shortlist__list .opt').count()) >= 1);
+    const note = await text(page, '.note');
+    assert.match(note, /did not find a tree it would stand behind/i);
+  },
+});
+
+/**
+ * The model provider breaking is an error, not an empty answer. It is stated
+ * where the visitor is looking, the reference shortlist stands in behind it,
+ * and no part of the page turns the failure into "Everroot has nothing" or
+ * into a claim about missing cultural records.
+ */
+await edgeState('suggestions-provider-failure-is-shown', {
+  setup: async (page) => {
+    await page.route('**/api/v1/recommendations', (route) =>
+      json(route, { error: 'the model provider failed' }, 502)
+    );
+  },
+  check: async (page) => {
+    const noteBody = page.locator('.note__body');
+    await noteBody.waitFor({ state: 'visible', timeout: 30000 });
+    const note = await noteBody.innerText();
+    assert.match(note, /Tree suggestions are unavailable right now\. Please try again\./);
+
+    // The shortlist is still filled by the botanical records, so a provider
+    // failure never leaves a blank page.
+    assert.ok((await page.locator('.shortlist__list .opt').count()) >= 1);
+
+    const body = await page.locator('body').innerText();
+    // Nothing was written by a model here, so nothing is presented as written
+    // by one, and nothing is presented as verified either.
+    assert.doesNotMatch(body, /AI-generated suggestion/);
+    assert.doesNotMatch(body, /Verified against a reviewed source/);
+    assert.match(body, /Botanical records only|not Nakshatra recommendations/);
+  },
+});
+
+/**
+ * Ask About a Tree is a separate capability from discovery, and it has to keep
+ * working beside it: a question is answered, and the answer is labelled as
+ * machine-written rather than as a record.
+ */
+await edgeState('ask-about-a-tree-still-answers', {
+  setup: async (page) => {
+    await page.route('**/api/v1/questions', (route) =>
+      json(route, {
+        status: 'ok',
+        interactionId: 'interaction-stub',
+        question: 'What family does Jamun belong to?',
+        answer: 'Jamun is Syzygium cumini, in the myrtle family, Myrtaceae.',
+        promptVersion: 'v1.0-structured-answers',
+        model: 'stub-model',
+        disclaimer: 'General knowledge only.',
+      })
+    );
+  },
+  check: async (page) => {
+    const ask = page.locator('input[placeholder*="What family does Jamun"]');
+    await ask.waitFor({ state: 'visible' });
+    await ask.fill('What family does Jamun belong to?');
+    await page.locator('button.btn--primary:has-text("Ask")').click();
+    await page.waitForSelector('text=Jamun is Syzygium cumini');
+
+    const body = await page.locator('body').innerText();
+    assert.match(body, /Machine-written from general botanical knowledge/);
+    // A general-knowledge answer is never presented as a reviewed record.
+    assert.doesNotMatch(body, /Verified against a reviewed source/);
+  },
+});
+
 /* ------------------------------ discovery catalogue: 404, 503 and recovery */
+
+/**
+ * A suggestion reply from a model that answered. Held here rather than inline
+ * so the catalogue-failure checks can prove the two calls are independent: the
+ * reviewed catalogue 503s while this one succeeds.
+ */
+const SUGGESTIONS_FIXTURE = {
+  status: 'ok',
+  suggestions: [
+    {
+      name: 'Neem',
+      scientificName: 'Azadirachta indica',
+      whyItMatches: 'It suits the courtyard you wrote about, and it asks for little care.',
+      botanicalDetail: 'A tree in the mahogany family, native to the Indian subcontinent.',
+      growingRequirements: ['Full sun', 'Deep soil'],
+      limitations: ['Fast surface roots'],
+    },
+    {
+      name: 'Jamun',
+      scientificName: 'Syzygium cumini',
+      whyItMatches: 'A long-lived tree for a place that matters to you.',
+      botanicalDetail: 'A tree in the myrtle family, native to the Indian subcontinent.',
+      growingRequirements: ['Moist soil'],
+      limitations: [],
+    },
+  ],
+  evidence: {
+    // Nothing was queried for this visitor, so nothing is claimed.
+    culturalAssociation: 'not_queryable',
+    botanicalIdentity: 'unavailable',
+    habitat: 'no_reviewed_record',
+    ecologicalRole: 'no_reviewed_record',
+    documentedStories: 'no_reviewed_record',
+    personalMeaning: 'user_owned',
+  },
+  promptVersion: 'v1.0-structured-suggestions',
+  model: 'stub-model',
+  disclaimer: 'Machine-written.',
+};
+
+/**
+ * The wait and the arrival. While the model is working a bird crosses the
+ * garden, and when the answer arrives it comes to rest on the tree that was
+ * chosen — the information is what the bird found, not a list that happens to
+ * appear beside a spinner.
+ *
+ * These contexts run with reduced motion, so the scene must go straight to the
+ * finished picture: the bird already perched, the tree named for anyone using
+ * assistive tech, and the cards actually shown. A visitor who asked for no
+ * movement still gets the whole answer.
+ */
+await edgeState('the-bird-lands-on-the-chosen-tree', {
+  setup: async (page) => {
+    await page.route('**/api/v1/recommendations', (route) => json(route, SUGGESTIONS_FIXTURE));
+  },
+  check: async (page) => {
+    const scene = page.locator('.shortlist__flight svg');
+    await scene.waitFor({ state: 'visible', timeout: 30000 });
+
+    // The scene says which tree it is resting on, so the picture and the
+    // shortlist cannot drift apart.
+    assert.match(await scene.getAttribute('aria-label'), /resting on Neem/i);
+    assert.match(await text(page, '.shortlist__flight'), /here is why it was chosen for you/i);
+
+    // And the arrival really did reveal the answer rather than replace it.
+    const cards = page.locator('.shortlist__list .opt');
+    assert.equal(await cards.count(), 2);
+    assert.match(await cards.first().innerText(), /Neem/);
+  },
+});
 
 /**
  * The catalogue the discovery flow loads at the tradition step. In production
@@ -711,12 +1001,18 @@ await (async () => {
   await context.close();
 })();
 
+const CATALOGUE_503_BODY = {
+  error: 'the reviewed catalogue is unavailable right now; please try again shortly',
+};
+
 await (async () => {
   const state = 'catalogue-503-unavailable';
   const { context, page } = await discoveryCatalogue(state, async (p) => {
-    const body = { error: 'the reviewed catalogue is unavailable right now; please try again shortly' };
-    await p.route('**/api/v1/traditions', (route) => json(route, body, 503));
-    await p.route('**/api/v1/nakshatras', (route) => json(route, body, 503));
+    await p.route('**/api/v1/traditions', (route) => json(route, CATALOGUE_503_BODY, 503));
+    await p.route('**/api/v1/nakshatras', (route) => json(route, CATALOGUE_503_BODY, 503));
+    // The suggestion call answers while the reviewed catalogue does not. They
+    // are separate services, and only one of them is needed to keep going.
+    await p.route('**/api/v1/recommendations', (route) => json(route, SUGGESTIONS_FIXTURE));
   });
 
   await step(`${state}: an unavailable catalogue is reported as unavailable, not as missing`, async () => {
@@ -728,7 +1024,167 @@ await (async () => {
     // This is a database problem, not a misconfigured origin.
     assert.doesNotMatch(copy, /PUBLIC_API_URL/);
     assert.doesNotMatch(copy, /no traditions|nothing on record/i);
+    // And it is a warning rather than a dead end.
+    assert.match(copy, /continue without choosing a tradition/i);
     assert.equal(await page.locator('.choices .choice').count(), 0);
+  });
+
+  await step(`${state}: an optional catalogue does not hold the visitor at the step`, async () => {
+    const next = page.locator('.step__actions-end button').last();
+    assert.equal(
+      await next.isEnabled(),
+      true,
+      'an unavailable cultural catalogue must not gate the whole flow'
+    );
+    assert.match(await next.innerText(), /Skip and see my result/);
+    await next.click();
+    await page.waitForURL(/\/results\//, { timeout: 30000 });
+    await page.waitForSelector('.shortlist__list .opt', { timeout: 30000 });
+  });
+
+  await step(`${state}: the suggestions arrive without the reviewed records`, async () => {
+    assert.equal(await page.locator('.shortlist__list .opt').count(), 2);
+    const tags = page.locator('.shortlist__list .opt .tag');
+    assert.match(await tags.first().innerText(), /AI-generated suggestion/);
+    // Nothing was consulted for this visitor, so the page says what the trees
+    // rest on instead of implying a reviewed association either way.
+    assert.match(await text(page, '.summary__lede'), /not a reviewed cultural record/);
+    assert.match(await text(page, '.pill'), /Botanical records only/);
+    const body = await page.locator('body').innerText();
+    assert.doesNotMatch(body, /Verified against a reviewed source/);
+  });
+
+  await page.screenshot({ path: path.join(SHOTS, `${state}.png`), fullPage: true });
+  await context.close();
+})();
+
+/**
+ * The same outage on the third step of the cultural path. The warning is still
+ * shown, and the step is still one the visitor can leave by pressing the
+ * button — an optional dataset never strands anyone mid-flow.
+ */
+await (async () => {
+  const state = 'catalogue-503-step-three-navigation';
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    reducedMotion: 'reduce',
+  });
+  const page = await context.newPage();
+  page.on('pageerror', (error) => consoleErrors.push(`[discovery:${state}] ${error.message}`));
+  await page.route('**/api/v1/traditions', (route) => json(route, CATALOGUE_503_BODY, 503));
+  await page.route('**/api/v1/nakshatras', (route) => json(route, CATALOGUE_503_BODY, 503));
+  await page.route('**/api/v1/recommendations', (route) => json(route, SUGGESTIONS_FIXTURE));
+
+  await step(`${state}: step three warns and still moves forward`, async () => {
+    await page.goto(`${BASE}/discover?intent=culture`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.step__actions-end button', { timeout: 30000 });
+    await page.locator('.step__actions-end button').last().click();
+
+    // Step two asks which kind of tradition, and one of them leads to step three.
+    const choice = page.locator('.choice', { hasText: 'Nakshatra or astrological traditions' });
+    await choice.waitFor({ state: 'visible', timeout: 20000 });
+    await choice.click();
+    await page.locator('.step__actions-end button').last().click();
+
+    await page.waitForSelector('.step__count', { timeout: 20000 });
+    assert.match(await text(page, '.step__count'), /step 3 of 3/i);
+
+    const notice = page.locator('.notice--warn');
+    await notice.waitFor({ state: 'visible', timeout: 20000 });
+    assert.match(await notice.innerText(), /503/);
+
+    const next = page.locator('.step__actions-end button').last();
+    assert.equal(await next.isEnabled(), true, 'step three must stay navigable');
+    assert.match(await next.innerText(), /Skip and see everything on record/);
+    await next.click();
+
+    await page.waitForURL(/\/results\//, { timeout: 30000 });
+    await page.waitForSelector('.shortlist__list .opt', { timeout: 30000 });
+    assert.equal(await page.locator('.shortlist__list .opt').count(), 2);
+  });
+
+  await page.screenshot({ path: path.join(SHOTS, `${state}.png`), fullPage: true });
+  await context.close();
+})();
+
+/**
+ * What the model may add beside its suggestions, and what it may not.
+ *
+ * A mature size decides whether a tree is even possible in the visitor's space.
+ * A cultural note may only restate a verdict the server computed, so the card
+ * still says it is not a cultural association. A follow-up question is shown as
+ * a question — beside the answer it did not wait for, with nowhere to type a
+ * reply, because answering one is what "Change my answers" is for.
+ */
+await (async () => {
+  const state = 'model-optional-extras';
+  const NOTE = 'Everroot has no reviewed record for this tradition and Nakshatra.';
+  const QUESTION = 'How much direct sun does the spot get through the day?';
+  const fixture = {
+    ...SUGGESTIONS_FIXTURE,
+    evidence: { ...SUGGESTIONS_FIXTURE.evidence, culturalAssociation: 'no_reviewed_match' },
+    suggestions: [
+      {
+        name: 'Neem',
+        scientificName: 'Azadirachta indica',
+        whyItMatches: 'It suits the courtyard you wrote about, and it asks for little care.',
+        botanicalDetail: 'A tree in the mahogany family, native to the Indian subcontinent.',
+        matureSize: '15–20 m',
+        growingRequirements: ['Full sun', 'Deep soil'],
+        limitations: ['Fast surface roots'],
+        culturalNote: NOTE,
+      },
+    ],
+    followUpQuestion: QUESTION,
+  };
+
+  const { context, page } = await discoveryCatalogue(state, async (p) => {
+    await p.route('**/api/v1/traditions', (route) => json(route, CATALOGUE_503_BODY, 503));
+    await p.route('**/api/v1/nakshatras', (route) => json(route, CATALOGUE_503_BODY, 503));
+    await p.route('**/api/v1/recommendations', (route) => json(route, fixture));
+  });
+
+  await step(`${state}: a mature size is shown as a fact that decides the space`, async () => {
+    const next = page.locator('.step__actions-end button').last();
+    await next.click();
+    await page.waitForURL(/\/results\//, { timeout: 30000 });
+    await page.waitForSelector('.shortlist__list .opt', { timeout: 30000 });
+
+    const card = page.locator('.shortlist__list .opt').first();
+    // The facts live behind "Explore this tree", which is how the shortlist
+    // stays a list rather than a wall of text.
+    await card.locator('button[aria-expanded]').click();
+    await card.locator('.opt__facts').waitFor({ state: 'visible', timeout: 20000 });
+
+    const details = await card.innerText();
+    assert.match(details, /Mature size/);
+    assert.match(details, /15.?20 m/);
+    // Above the care notes, because it rules the tree in or out before care is
+    // worth discussing.
+    assert.ok(
+      details.indexOf('Mature size') < details.indexOf('Growing'),
+      'mature size should come before the growing needs'
+    );
+  });
+
+  await step(`${state}: the model's sentence explains the record, never the tree`, async () => {
+    const card = page.locator('.shortlist__list .opt').first();
+    assert.match(await card.innerText(), new RegExp(NOTE));
+    // The verdict itself is still the server's, and it was not upgraded by a
+    // machine writing a sentence about it.
+    assert.match(await card.innerText(), /Not a cultural association/);
+    assert.match(await text(page, '.pill'), /Botanical records only/);
+  });
+
+  await step(`${state}: a question is shown as a question, not as a form`, async () => {
+    const ask = page.locator('.summary__ask');
+    await ask.waitFor({ state: 'visible', timeout: 20000 });
+    assert.match(await ask.innerText(), /One thing that would help/);
+    assert.match(await ask.innerText(), new RegExp(QUESTION));
+    // It arrived beside the suggestions, which are still on the page.
+    assert.equal(await page.locator('.shortlist__list .opt').count(), 1);
+    // And there is nowhere to answer it here: it is an offer, not a step.
+    assert.equal(await ask.locator('input, textarea, select, button').count(), 0);
   });
 
   await page.screenshot({ path: path.join(SHOTS, `${state}.png`), fullPage: true });
@@ -747,6 +1203,12 @@ for (const failure of failures) console.log(`FAILED: ${failure.name}\n  ${failur
 if (consoleErrors.length) {
   console.log(`\nconsole errors (${consoleErrors.length}):`);
   for (const error of consoleErrors.slice(0, 20)) console.log(`  ${error}`);
+}
+if (toleratedErrors.length) {
+  console.log(
+    `\nexpected 503s from the suggestion service (${toleratedErrors.length}) — this suite runs the API with no HF_TOKEN:`
+  );
+  for (const error of toleratedErrors.slice(0, 5)) console.log(`  ${error}`);
 }
 
 if (failures.length || consoleErrors.length) process.exit(1);

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
+  import BirdScene from '../../../lib/components/BirdScene.svelte';
   import Icon from '../../../lib/components/Icon.svelte';
   import TreeOption from '../../../lib/components/TreeOption.svelte';
-  import { referenceOption, reviewedOption } from '../../../lib/treeOption';
+  import { referenceOption, reviewedOption, suggestionOption, SUGGESTION_RULE } from '../../../lib/treeOption';
   import { filterTrees } from '../../../lib/treeOption';
   import type { TreeOptionView } from '../../../lib/treeOption';
   import {
@@ -21,10 +22,12 @@
     loadRecord,
     loadSaved,
     personalReflection,
+    recommendationsRequest,
     removeDedication,
     resolveIntentionId,
     runDiscovery,
     runExplain,
+    runRecommendations,
     saveDedication,
     saveRecord,
     submitFeedback,
@@ -36,6 +39,7 @@
     DiscoveryRequestInput,
     EvidenceStatus,
     ExplanationEnvelope,
+    RecommendationSuggestion,
     TreeFact,
   } from '../../../lib/discovery';
 
@@ -70,6 +74,50 @@
   let explorationTrees = $state<TreeFact[]>([]);
   let explorationLoading = $state(false);
   let explorationNotice = $state('');
+
+  /**
+   * Tree suggestions drawn from the visitor's own answers.
+   *
+   * A separate track from both reviewed records and the botanical reference:
+   * it needs neither the database nor the catalogue, so an empty or unreachable
+   * catalogue cannot stop a suggestion arriving. Everything it produces is
+   * labelled as generated wherever it is shown.
+   */
+  let suggestions = $state<RecommendationSuggestion[]>([]);
+  let suggestionsEvidence = $state<EvidenceStatus | null>(null);
+  let suggestionsStatus = $state('');
+  let suggestionsLoading = $state(false);
+  let suggestionNotice = $state('');
+  /**
+   * The one question the model asked because a missing fact would have changed
+   * its suggestions. It arrives beside the answer, never instead of it, and it
+   * has no field of its own to be typed into: "Change my answers" is how a
+   * visitor answers it, so nothing here sends a second model call.
+   */
+  let suggestionsQuestion = $state('');
+
+  /**
+   * Where the bird is, and therefore what the visitor is being asked to watch.
+   *
+   * ''         no suggestion call is running and none has landed
+   * 'flying'   the model has not answered yet, so the bird is crossing the garden
+   * 'landing'  an answer arrived and the bird is coming down onto that tree
+   * 'landed'   the bird is resting, so the information beside it may be read
+   *
+   * The scene is decoration over a real state: it never slows the call, and it
+   * is dropped entirely when there is no answer to rest on.
+   */
+  let birdPhase = $state<'flying' | 'landing' | 'landed' | ''>('');
+  let birdTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Only run the landing sequence when the visitor has not asked for stillness. */
+  function prefersStillness(): boolean {
+    return (
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    );
+  }
 
   let catalogue = $state<TreeFact[]>([]);
   let catalogueOrdering = $state('');
@@ -145,11 +193,26 @@
 
   /** The cultural-association state, as the server's own publication gate reported it. */
   const culturalAssociation = $derived(
-    hasResults ? 'reviewed_match' : (explorationEvidence?.culturalAssociation ?? '')
+    hasResults
+      ? 'reviewed_match'
+      : (suggestionsEvidence?.culturalAssociation ?? explorationEvidence?.culturalAssociation ?? '')
   );
 
   /**
-   * The botanical records the shortlist is drawn from. The explanation endpoint
+   * The AI suggestions, shaped for the same card as every other option and
+   * tagged as generated. The cultural verdict on each card still comes from the
+   * publication gate — never from the model that wrote the suggestion.
+   */
+  const suggestionViews = $derived(
+    suggestions
+      .slice(0, SHORTLIST_SIZE)
+      .map((suggestion, index) =>
+        suggestionOption(suggestion, index, 'shortlist', culturalAssociation)
+      )
+  );
+
+  /**
+   * The botanical records the shortlist falls back to. The explanation endpoint
    * returns the same three records it was given, so the shortlist still renders
    * when the provider is switched off or unreachable.
    */
@@ -172,10 +235,26 @@
     if (hasResults) {
       return recommendations.slice(0, SHORTLIST_SIZE).map((rec, index) => reviewedOption(rec, index));
     }
+    // A suggestion was drawn from these answers; the reference simply is on
+    // file. So when there is no reviewed record, the visitor's own answers come
+    // first and the catalogue stands behind them.
+    if (suggestionViews.length) return suggestionViews;
     return referenceTrees
       .slice(0, SHORTLIST_SIZE)
       .map((tree, index) => referenceOption(tree, index, 'shortlist', true, culturalAssociation));
   });
+
+  /** Both calls that can fill the shortlist have settled and neither produced anything. */
+  const shortlistPending = $derived(exploratory && (suggestionsLoading || explorationLoading));
+  const shortlistEmpty = $derived(
+    exploratory && !shortlist.length && !suggestionsLoading && !explorationLoading
+  );
+  const shortlistEmptyReason = $derived(
+    [suggestionNotice, explorationNotice].filter(Boolean).join(' ') ||
+      (suggestionsStatus === 'no_suggestions'
+        ? 'The suggestion model did not find a tree it would stand behind for these answers, and the botanical reference has no records yet.'
+        : 'The suggestion service returned nothing for these answers, and the botanical reference has no records yet.')
+  );
 
   const headline = $derived(
     hasResults
@@ -197,6 +276,14 @@
         : `${recommendations.length} associations are on record for this selection, each with the sources it rests on.`;
     }
     if (!record || record.error) return '';
+    if (suggestionViews.length) {
+      // What these trees are, said once and plainly: they answer the visitor's
+      // own answers rather than a record, so they say so instead of carrying a
+      // warning about a dataset that was never consulted for them.
+      return suggestionViews.length === 1
+        ? 'One tree suggested from your answers — general botany written by the AI model, not a reviewed cultural record.'
+        : `${suggestionViews.length} trees suggested from your answers — general botany written by the AI model, not a reviewed cultural record.`;
+    }
     if (needsNakshatra) {
       return 'You skipped the Nakshatra step, so there is no cultural record to check. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
     }
@@ -206,7 +293,8 @@
     return 'There is no reviewed cultural association on record for this selection yet. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
   });
 
-  const ledeIsNotice = $derived(!hasResults);
+  /** The dataset-bound framing is a notice; a suggestion is simply what it says it is. */
+  const ledeIsNotice = $derived(!hasResults && !suggestionViews.length);
 
   /**
    * A discreet indicator of what backs the page, not a promise about the trees.
@@ -223,11 +311,40 @@
 
   const shortlistNote = $derived.by(() => {
     if (hasResults || !exploratory) return null;
+    if (suggestionViews.length) {
+      // These were written from the visitor's answers, so the note explains
+      // what a suggestion is instead of carrying a summary nobody wrote.
+      return {
+        label: 'About these suggestions',
+        loading: false,
+        loadingText: '',
+        text: SUGGESTION_RULE,
+        meta: 'There is no citation behind these, because they were written for you rather than quoted from a record. Open the tree reference to check a name against an authority record.',
+        notice: '',
+      };
+    }
+    const notice = [
+      // A model that found nothing is telling the visitor something, and that
+      // stays true even though the reference could fill the shortlist behind it.
+      suggestionsStatus === 'no_suggestions'
+        ? 'The suggestion model did not find a tree it would stand behind for these answers, so the botanical records below stand in — they are not suggestions.'
+        : '',
+      suggestionNotice,
+      explorationNotice,
+    ]
+      .filter(Boolean)
+      .join(' ');
     return {
       label: 'Exploration summary',
-      loading: explorationLoading && !explorationNotice,
-      text: exploration?.status === 'ok' ? exploration.text : '',
-      notice: explorationNotice,
+      loading: suggestionsLoading || (explorationLoading && !explorationNotice),
+      loadingText: suggestionsLoading
+        ? 'Asking the AI model for tree suggestions…'
+        : 'Asking for a summary…',
+      // A failure outranks a summary: the visitor has to know the call broke
+      // rather than be handed prose as if nothing had gone wrong.
+      text: notice ? '' : (exploration?.status === 'ok' ? exploration.text : ''),
+      meta: 'Written by an AI from the botanical facts above, for your answers rather than quoted from a record.',
+      notice,
     };
   });
 
@@ -289,9 +406,10 @@
     }
     // The reference is always loaded, so its count is honest in both paths.
     void loadCatalogue();
-    if (!hasResults && !record?.error) {
-      void loadExploration();
-    }
+    // The cultural lookup and the suggestion call are independent. A failed
+    // lookup must not cost the visitor their suggestions, and neither may
+    // depend on the botanical catalogue being readable.
+    if (!hasResults) void loadSuggestions();
   }
 
   async function query(request: DiscoveryRequestInput) {
@@ -316,15 +434,64 @@
     await query(request);
     retrying = false;
     void loadCatalogue();
-    if (!hasResults && !record.error) void loadExploration();
+    // A failed suggestion call is worth another attempt when the visitor asks
+    // again; one that already arrived is not re-bought for an unrelated retry.
+    if (!hasResults && !record.error && !suggestions.length) void loadSuggestions();
   }
 
   /* --------------------------------------------- exploratory discovery */
 
   /**
-   * The single provider call on this page. It returns the shortlist records and
-   * the cultural-association state whatever the provider does, so a provider
-   * failure never empties the shortlist.
+   * Tree suggestions from the visitor's answers: the first call this page makes
+   * and the only one that needs neither the database nor the botanical
+   * catalogue. It is allowed to fail on its own terms — a failure is recorded
+   * as a failure, never turned into an empty list — and when it produces
+   * nothing, the exploration call below still runs so the shortlist is never
+   * left blank by one unavailable service.
+   */
+  async function loadSuggestions() {
+    // One request per result, and never a second while one is in flight: these
+    // are paid calls, so a re-entry must not silently buy another answer.
+    if (!record || suggestionsLoading || suggestions.length) return;
+    suggestionsLoading = true;
+    suggestionNotice = '';
+    suggestionsQuestion = '';
+    birdPhase = 'flying';
+    clearTimeout(birdTimer);
+    try {
+      const response = await runRecommendations(recommendationsRequest(answers));
+      suggestions = response.suggestions;
+      suggestionsEvidence = response.evidence;
+      suggestionsStatus = response.status;
+      suggestionsQuestion = response.followUpQuestion ?? '';
+      if (suggestions.length) {
+        // There is a tree to rest on, so the bird comes down onto it. A visitor
+        // who asked for no motion goes straight to the finished picture.
+        birdPhase = prefersStillness() ? 'landed' : 'landing';
+        birdTimer = setTimeout(() => (birdPhase = 'landed'), 1600);
+      } else {
+        birdPhase = '';
+      }
+    } catch (error) {
+      suggestions = [];
+      suggestionsEvidence = null;
+      suggestionsStatus = '';
+      suggestionsQuestion = '';
+      // Nothing landed, so the scene goes away with it: a picture of success
+      // over a failed call would be the same lie as an empty list.
+      birdPhase = '';
+      suggestionNotice =
+        error instanceof Error ? error.message : 'Tree suggestions are unavailable right now.';
+    } finally {
+      suggestionsLoading = false;
+    }
+    if (!suggestions.length) void loadExploration();
+  }
+
+  /**
+   * The grounding call behind the reference shortlist. It returns the shortlist
+   * records and the cultural-association state whatever the provider does, so a
+   * provider failure never empties the shortlist.
    */
   async function loadExploration() {
     if (!record || explorationLoading) return;
@@ -381,6 +548,7 @@
   }
 
   onMount(load);
+  onDestroy(() => clearTimeout(birdTimer));
 
   /* ------------------------------------------------------------ actions */
 
@@ -509,6 +677,19 @@
             </p>
           {/if}
 
+          <!--
+            A question the model asked because one missing fact would have
+            changed what it suggested. It is shown as a question, beside the
+            answer it did not wait for, and it has no field of its own: the
+            visitor answers it the way they answered everything else here.
+          -->
+          {#if suggestionsQuestion}
+            <p class="summary__ask">
+              <Icon name="info" size={17} />
+              <span><strong>One thing that would help:</strong> {suggestionsQuestion}</span>
+            </p>
+          {/if}
+
           <dl class="facts">
             <div class="fact">
               <dt>What matters to you</dt>
@@ -560,8 +741,43 @@
         {/if}
 
         <!-- ----------------------------------------- B. the shortlist -->
-        {#if shortlist.length}
+        {#if shortlist.length || shortlistPending || shortlistEmpty}
           <section class="shortlist" aria-labelledby="shortlist-title">
+            <!--
+              The wait, and the arrival. While the model works the bird crosses
+              the garden; when the answer comes it comes down onto the chosen
+              tree, and the information below is what it found. Shown only while
+              a suggestion call is genuinely running or has genuinely landed —
+              a failure or an empty answer drops the scene rather than pose as
+              a success.
+            -->
+            {#if birdPhase !== ''}
+              <div
+                class="shortlist__flight"
+                class:shortlist__flight--settled={birdPhase === 'landed'}
+              >
+                <BirdScene
+                  phase={birdPhase}
+                  treeName={suggestionViews[0]?.title ?? suggestions[0]?.name ?? ''}
+                >
+                  {#if birdPhase === 'flying'}
+                    <p class="flight__caption" role="status">
+                      Asking the model which tree fits your answers…
+                    </p>
+                  {:else if birdPhase === 'landing'}
+                    <p class="flight__caption" role="status">
+                      Found it — bringing you the tree it chose.
+                    </p>
+                  {:else if suggestionViews[0]?.title || suggestions[0]?.name}
+                    <p class="flight__caption">
+                      Resting on <strong>{suggestionViews[0]?.title ?? suggestions[0]?.name}</strong>
+                      — here is why it was chosen for you.
+                    </p>
+                  {/if}
+                </BirdScene>
+              </div>
+            {/if}
+
             <div class="shortlist__head">
               <h2 id="shortlist-title" class="shortlist__title">
                 {hasResults
@@ -570,7 +786,7 @@
                     : 'The associations on record'
                   : 'Start with these'}
               </h2>
-              {#if !hasResults && shortlist.length < SHORTLIST_SIZE}
+              {#if !hasResults && !suggestionViews.length && shortlist.length < SHORTLIST_SIZE}
                 <p class="shortlist__count">
                   {catalogue.length}
                   {catalogue.length === 1 ? 'tree is' : 'trees are'} in Everroot’s botanical
@@ -579,7 +795,14 @@
               {/if}
             </div>
 
-            {#if shortlistNote && (shortlistNote.loading || shortlistNote.text || shortlistNote.notice)}
+            {#if shortlistEmpty}
+              <!-- Nothing to show, and both calls that could have filled it have
+                   settled. Saying so is the alternative to a silent page. -->
+              <p class="shortlist__count" role="status">
+                <strong>Nothing to show for these answers yet.</strong>
+                {shortlistEmptyReason}
+              </p>
+            {:else if shortlistNote && (shortlistNote.loading || shortlistNote.text || shortlistNote.notice)}
               <div class="note card-surface" aria-live="polite">
                 <p class="note__label">
                   <Icon name="sparkle" size={16} /> {shortlistNote.label}
@@ -587,21 +810,24 @@
                 {#if shortlistNote.loading}
                   <p class="note__body">
                     <span class="spinner spinner--sm" aria-hidden="true"></span>
-                    Asking for a summary…
+                    {shortlistNote.loadingText}
                   </p>
                 {:else if shortlistNote.text}
                   <p class="note__body">{shortlistNote.text}</p>
-                  <p class="note__meta">
-                    Written by an AI from the botanical facts above. Machine-written, not a reviewed
-                    record, and never a cultural claim.
-                  </p>
+                  <p class="note__meta">{shortlistNote.meta}</p>
                 {:else if shortlistNote.notice}
                   <p class="note__body">{shortlistNote.notice}</p>
                 {/if}
               </div>
             {/if}
 
-            <div class="shortlist__list">
+            <!-- The cards exist from the moment the answer arrives, so nothing
+                 is waiting on an animation to become readable: the settle only
+                 moves them into place as the bird folds its wings. -->
+            <div
+              class="shortlist__list"
+              class:shortlist__list--arriving={birdPhase === 'landing'}
+            >
               {#each shortlist as option (option.key)}
                 <TreeOption
                   {option}
@@ -699,6 +925,10 @@
             <span class="cat__toggle-meta">
               {#if catalogueAvailable === null}
                 loading…
+              {:else if catalogueNotice}
+                <!-- An unreadable reference is not an empty one: saying "0 available" here
+                     would report a failure as a fact about Everroot's records. -->
+                unavailable
               {:else}
                 {catalogueAvailable} available
               {/if}
@@ -1080,6 +1310,29 @@
     color: var(--color-earth);
   }
 
+  /* A question beside the answer: quieter than the notice, because it is an
+     offer rather than a limitation. */
+  .summary__ask {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    margin: 0.7rem 0 0;
+    max-width: 64ch;
+    color: var(--color-charcoal-soft);
+    line-height: 1.6;
+    font-size: 0.94rem;
+  }
+
+  .summary__ask :global(svg) {
+    flex: none;
+    margin-top: 0.2rem;
+    color: var(--color-earth);
+  }
+
+  .summary__ask strong {
+    color: var(--color-charcoal, #2c3025);
+  }
+
   .facts {
     display: flex;
     flex-wrap: wrap;
@@ -1133,9 +1386,53 @@
     color: var(--color-charcoal-soft);
   }
 
+  /* ------------------------------------------------ the bird and its landing */
+  .shortlist__flight {
+    margin: 0 0 0.35rem;
+    animation: flight-in 0.45s ease-out both;
+  }
+
+  .flight__caption {
+    margin: 0;
+  }
+
   .shortlist__list {
     display: grid;
     gap: 0.75rem;
+    /* The cards are already in the document while the bird is still coming
+       down — they are only moved into place, never withheld from a reader. */
+    transition: opacity 0.6s ease, transform 0.6s ease;
+  }
+
+  .shortlist__list--arriving {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  @keyframes flight-in {
+    from {
+      opacity: 0;
+      transform: translateY(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .shortlist__flight {
+      animation: none;
+    }
+
+    .shortlist__list {
+      transition: none;
+    }
+
+    .shortlist__list--arriving {
+      opacity: 1;
+      transform: none;
+    }
   }
 
   .note {

@@ -105,7 +105,7 @@ func (a *API) askQuestion(w http.ResponseWriter, r *http.Request) {
 		if diag.RetryAfter > 0 {
 			w.Header().Set("Retry-After", retryAfterSeconds(diag.RetryAfter))
 		}
-		status, message := aiFailureResponse(diag)
+		status, message := aiFailureResponse(diag, "question")
 		writeError(w, status, message)
 		return
 	}
@@ -228,12 +228,22 @@ func nullIfEmpty(s string) any {
 // message. A busy provider is reported as 429 so a caller knows to retry;
 // every other provider failure stays a 503, because only the operator can act
 // on it. The message never names a provider, a status, or a token.
-func aiFailureResponse(d ai.Diagnosis) (int, string) {
+// aiFailureResponse maps an inference diagnosis to a status and a message for
+// the named service. Only the sentence that names the capability changes: a
+// visitor told "the question service is not configured" while it was the
+// suggestion service that never ran would be sent to the wrong fix.
+//
+// A reply Everroot cannot read is a different fact from a provider that is
+// down, so it is reported as such rather than as a temporary outage — the
+// remedy is to ask again, but the cause is not congestion.
+func aiFailureResponse(d ai.Diagnosis, service string) (int, string) {
 	switch d.Category {
 	case ai.CategoryNotConfigured:
-		return http.StatusServiceUnavailable, "The AI question service is not configured. Please ensure HF_TOKEN is set."
+		return http.StatusServiceUnavailable, fmt.Sprintf("The AI %s service is not configured. Please ensure HF_TOKEN is set.", service)
 	case ai.CategoryRateLimited:
 		return http.StatusTooManyRequests, "The AI service is busy right now. Please try again in a moment."
+	case ai.CategoryBadResponse:
+		return http.StatusBadGateway, "The AI service replied with something Everroot could not read. Please try again."
 	default:
 		return http.StatusServiceUnavailable, "The AI service is temporarily unavailable. Please try again."
 	}

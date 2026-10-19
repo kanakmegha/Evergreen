@@ -76,10 +76,21 @@
     return nakshatras.filter((n) => n.name.toLowerCase().includes(q));
   });
 
+  /**
+   * The tradition step asks for context, not for permission to continue. When
+   * the reviewed catalogue cannot be served there is nothing on the page to
+   * choose from, and an optional dataset must never hold the visitor at this
+   * question — the same is true when the catalogue is readable but has
+   * published nothing yet. While it is still loading, the question stands.
+   */
+  const traditionSkippable = $derived(
+    catalogState === 'error' || (catalogState === 'ready' && traditions.length === 0)
+  );
+
   const canContinue = $derived.by(() => {
     if (step === 'intention') return answers.intention !== null;
     if (step === 'followup') return follow?.choices ? answers.followUpChoice !== null : true;
-    if (step === 'tradition') return answers.tradition !== null;
+    if (step === 'tradition') return answers.tradition !== null || traditionSkippable;
     return true; // the nakshatra step is always skippable
   });
 
@@ -88,6 +99,11 @@
       return answers.nakshatra
         ? 'See the associations on record'
         : 'Skip and see everything on record';
+    }
+    // Nothing was offered, so the button says what pressing it actually does
+    // rather than implying a choice was made.
+    if (step === 'tradition' && traditionSkippable && !answers.tradition) {
+      return 'Skip and see my result';
     }
     if (!isLastStep) return 'Continue';
     if (step === 'followup' && follow && !follow.choices) {
@@ -405,6 +421,10 @@
           {:else if catalogState === 'error'}
             <div class="notice notice--warn" role="alert">
               <p><strong>The catalogue could not be loaded.</strong> {catalogError}</p>
+              <p class="notice__hint">
+                Cultural context is optional. You can continue without choosing a tradition — your
+                result does not depend on it.
+              </p>
               <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadCatalog}>
                 Try again
               </button>
@@ -412,6 +432,7 @@
           {:else if traditions.length === 0}
             <div class="notice notice--info">
               <p>No traditions with reviewed records are published yet.</p>
+              <p class="notice__hint">You can continue without choosing one.</p>
             </div>
           {:else}
             <div class="choices" role="radiogroup" aria-labelledby="step-q">
@@ -604,6 +625,11 @@
   .step__status {
     margin-top: 1.25rem;
     color: var(--color-charcoal-soft);
+  }
+
+  /* The line under a catalogue warning that says the visitor can still move on. */
+  .notice__hint {
+    margin-top: 0.5rem;
   }
 
   .choices {

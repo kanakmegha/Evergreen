@@ -126,6 +126,39 @@ paths:
         '400': { description: Invalid intention, selection or request body }
         '404': { description: No botanical record for the requested tree }
         '503': { description: Botanical reference unavailable }
+  /api/v1/recommendations:
+    post:
+      operationId: suggestTrees
+      description: >
+        Draws tree suggestions for one visitor's answers using the configured
+        model. Deliberately separate from /api/v1/discoveries: that endpoint
+        answers what the publication gate has approved and can never return an
+        unreviewed cultural claim, while this one answers "what else might fit"
+        and so may exist for an intention that has no reviewed mapping at all.
+        It needs neither the database nor the botanical catalogue, so a
+        suggestion still arrives when the catalogue is empty or unreachable.
+        The visitor's own words travel in the request to build one prompt; they
+        are never stored and never logged. A failure is reported as a failure —
+        this endpoint never answers 200 with an empty list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecommendationsRequest' }
+      responses:
+        '200':
+          description: >
+            status is "ok" when suggestions were made and "no_suggestions" when
+            the model found nothing it would stand behind, which is an honest
+            answer rather than a failure. evidence.culturalAssociation is the
+            publication gate's verdict, never the model's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecommendationsResponse' }
+        '400': { description: Unsupported intention, invalid selection or limit }
+        '429': { description: Model is busy; the response carries a Retry-After header }
+        '502': { description: The model replied with something Everroot could not read }
+        '503': { description: AI recommendation service not configured or temporarily unavailable }
   /internal/v1/review/queue:
     get:
       operationId: reviewQueue
@@ -534,3 +567,68 @@ components:
         evidence: { $ref: '#/components/schemas/EvidenceStatus' }
         trees: { type: array, items: { $ref: '#/components/schemas/TreeFact' } }
         explanation: { $ref: '#/components/schemas/ExplanationEnvelope' }
+    RecommendationsRequest:
+      type: object
+      additionalProperties: false
+      required: [intention]
+      properties:
+        intention: { type: string, enum: [personal, remember, culture, future, explore] }
+        answer:
+          type: string
+          maxLength: 700
+          description: >
+            The visitor's own words, sent to build the prompt. Used once, never
+            stored, and never written to the log.
+        choice: { type: string, maxLength: 120, description: The follow-up option they picked, as the label they saw. }
+        picks: { type: array, maxItems: 20, items: { type: string, maxLength: 500 } }
+        tradition: { type: string, maxLength: 100 }
+        region: { type: string, maxLength: 100 }
+        nakshatra: { type: string, maxLength: 100 }
+        constraints: { type: array, maxItems: 20, items: { type: string, maxLength: 500 } }
+        limit: { type: integer, minimum: 1, maximum: 5, default: 3 }
+    Suggestion:
+      type: object
+      required: [name, whyItMatches]
+      description: >
+        Machine-written. It carries no source, and apart from the optional
+        restatement of the gate verdict in culturalNote it is never a cultural
+        association — those come only from reviewed records.
+      properties:
+        name: { type: string, maxLength: 80 }
+        scientificName:
+          type: string
+          maxLength: 140
+          description: Empty when the model was not sure of the accepted binomial, which is preferred to an invented one.
+        whyItMatches: { type: string, maxLength: 300 }
+        botanicalDetail: { type: string, maxLength: 320 }
+        matureSize:
+          type: string
+          maxLength: 60
+          description: Typical mature height, or the literal text "not sure".
+        growingRequirements: { type: array, maxItems: 6, items: { type: string, maxLength: 140 } }
+        limitations: { type: array, maxItems: 6, items: { type: string, maxLength: 200 } }
+        culturalNote:
+          type: string
+          maxLength: 200
+          description: >
+            Present only when evidence.culturalAssociation is no_reviewed_match,
+            and only ever restates that verdict in plain words. It describes the
+            record, not the tree, and it is never a source.
+    RecommendationsResponse:
+      type: object
+      required: [status, suggestions, evidence, promptVersion, model, disclaimer]
+      properties:
+        status: { type: string, enum: [ok, no_suggestions] }
+        suggestions: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/Suggestion' } }
+        evidence: { $ref: '#/components/schemas/EvidenceStatus' }
+        promptVersion: { type: string, example: v1.3-visitor-anchored-reasons }
+        model: { type: string }
+        disclaimer: { type: string, description: Present so an API consumer must invent no wording of its own for what the text is. }
+        followUpQuestion:
+          type: string
+          maxLength: 240
+          description: >
+            Omitted when absent. Present only when one missing fact would
+            materially change the suggestions; it is a question about the
+            visitor's circumstances and never a substitute for the answer, which
+            arrives in the same reply.

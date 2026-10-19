@@ -57,6 +57,19 @@ const defaultRetryDelay = 500 * time.Millisecond
 // final failure rather than making the visitor's request hang.
 const maxRetryDelay = 2 * time.Second
 
+// WorstCaseResponseTime is the longest one request can legitimately take: every
+// attempt the client will make under a transient failure, each bounded by
+// ProviderTimeout, with the capped backoff between them.
+//
+// The HTTP server's write deadline has to be longer than this. It once was
+// measured against a single attempt instead, so a provider that timed out and
+// then succeeded on a retry ran past the deadline and the connection was cut
+// mid-answer — the visitor was told the service could not be reached, for a
+// call that had been working the whole time. A slow answer and a broken one
+// have to stay different things.
+const WorstCaseResponseTime = time.Duration(defaultMaxAttempts)*ProviderTimeout +
+	time.Duration(defaultMaxAttempts-1)*maxRetryDelay
+
 // maxErrorBodyBytes bounds how much of a provider error body is inspected. Only
 // a whitelisted code is read from it; the body is never logged or forwarded.
 const maxErrorBodyBytes = 4 << 10

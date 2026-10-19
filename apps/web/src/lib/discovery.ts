@@ -130,7 +130,7 @@ export const FOLLOW_UPS: Partial<Record<IntentionId, FollowUpConfig>> = {
   personal: {
     question: 'What would you like this tree to hold?',
     intro:
-      'Anything you write here stays in this browser. Everroot does not send personal notes to the server.',
+      'A few words about what this tree is for. What you write is sent to the AI model that draws your suggestions — Everroot does not put it in its records.',
     prompt: 'A quality, a beginning, or something you are working toward',
     placeholder: 'e.g. Patience — for a year of learning to slow down.',
     hint: 'Optional. A few words are enough, and you can change this later.',
@@ -139,10 +139,10 @@ export const FOLLOW_UPS: Partial<Record<IntentionId, FollowUpConfig>> = {
   remember: {
     question: 'What qualities or memories would you like this tree to represent?',
     intro:
-      'You can write a quality, a memory, or a name — or skip this. There is no need to describe anything painful.',
+      'You can write a quality, a memory, or a name — or skip this. There is no need to describe anything painful. What you write is sent to the AI model that draws your suggestions; Everroot does not put it in its records.',
     prompt: 'A quality, a memory, or a name',
     placeholder: 'e.g. Quiet steadiness — the way she made room for everyone.',
-    hint: 'Optional. Whatever you write stays on this device.',
+    hint: 'Optional. Whatever you write is used to draw suggestions and is not put in Everroot’s records.',
     quickPicks: ['Gentleness', 'Strength', 'Curiosity', 'Home'],
   },
   culture: {
@@ -626,16 +626,144 @@ export async function runExplain(input: ExplainInput): Promise<ExplainResponse> 
   return {
     status: data.status ?? 'ok',
     task: data.task ?? '',
-    evidence: data.evidence ?? {
-      culturalAssociation: 'not_queryable',
-      botanicalIdentity: 'unavailable',
-      habitat: 'no_reviewed_record',
-      ecologicalRole: 'no_reviewed_record',
-      documentedStories: 'no_reviewed_record',
-      personalMeaning: 'user_owned',
-    },
+    evidence: data.evidence ?? emptyEvidence(),
     trees: Array.isArray(data.trees) ? data.trees : [],
     explanation: data.explanation ?? { status: 'unavailable', reason: 'provider_error', text: '', model: '' },
+  };
+}
+
+/* ---------------------------------------------------------------------------
+   AI suggestions
+
+   A separate call from /api/v1/discoveries on purpose. That endpoint answers
+   what Everroot's publication gate has approved and can never say yes without
+   a reviewer; this one asks the configured model what else might fit these
+   answers. Neither borrows the other's authority: a suggestion is machine
+   written wherever it is shown, and it never carries a cultural claim.
+--------------------------------------------------------------------------- */
+
+export interface RecommendationSuggestion {
+  name: string;
+  scientificName: string;
+  whyItMatches: string;
+  botanicalDetail: string;
+  /** Typical mature height, or the literal text "not sure". */
+  matureSize?: string;
+  growingRequirements: string[];
+  limitations: string[];
+  /**
+   * The model's one plain sentence restating the gate verdict it was handed.
+   * Present only when evidence.culturalAssociation is "no_reviewed_match", and
+   * it describes the record rather than the tree — so it never replaces the
+   * server's own verdict, which travels beside it as evidence.
+   */
+  culturalNote?: string;
+}
+
+export interface RecommendationsResponse {
+  /** "ok" when the model offered something, "no_suggestions" when it honestly had none. */
+  status: 'ok' | 'no_suggestions' | string;
+  suggestions: RecommendationSuggestion[];
+  /** The publication gate's verdict about the selection, never the model's opinion. */
+  evidence: EvidenceStatus;
+  promptVersion: string;
+  model: string;
+  disclaimer: string;
+  /**
+   * Omitted by the API when there is none. Present only when one missing fact
+   * would materially change the suggestions — and it never stands in for an
+   * answer, because the suggestions arrive with it.
+   */
+  followUpQuestion?: string;
+}
+
+export interface RecommendationsRequest {
+  intention: IntentionId;
+  answer: string;
+  choice: string;
+  picks: string[];
+  tradition: string;
+  region: string;
+  nakshatra: string;
+  constraints: string[];
+  limit: number;
+}
+
+/** Empty evidence, for a reply that arrived without it. */
+function emptyEvidence(): EvidenceStatus {
+  return {
+    culturalAssociation: 'not_queryable',
+    botanicalIdentity: 'unavailable',
+    habitat: 'no_reviewed_record',
+    ecologicalRole: 'no_reviewed_record',
+    documentedStories: 'no_reviewed_record',
+    personalMeaning: 'user_owned',
+  };
+}
+
+/**
+ * The visitor's selections and their own words, shaped for the endpoint.
+ *
+ * Nothing here is required by the server — an intention is the only field it
+ * insists on — so a path that never reached the cultural steps still produces a
+ * request, and a cultural selection arrives as context rather than as a claim.
+ */
+export function recommendationsRequest(answers: FlowAnswers): RecommendationsRequest {
+  return {
+    // Every step of the flow leaves an intention behind. A record written
+    // before the flow existed is treated as open curiosity rather than as
+    // something personal the visitor never chose to share.
+    intention: answers.intention ?? 'explore',
+    answer: answers.followUpNote.trim(),
+    choice:
+      followUpOptionLabel(answers.intention, answers.followUpChoice) ?? answers.followUpChoice ?? '',
+    picks: [...answers.followUpPicks],
+    tradition: answers.tradition ?? '',
+    region: answers.region ?? '',
+    nakshatra: answers.nakshatra ?? '',
+    // Practical requirements, when the caller has any to state. The flow keeps
+    // them in the visitor's own words instead, which is what `answer` carries.
+    constraints: [],
+    limit: 3,
+  };
+}
+
+export async function runRecommendations(
+  input: RecommendationsRequest
+): Promise<RecommendationsResponse> {
+  let res: Response;
+  try {
+    res = await fetch(apiURL('/api/v1/recommendations'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(input),
+    });
+  } catch {
+    throw new Error('The suggestion service could not be reached from this browser.');
+  }
+  if (!res.ok) {
+    // A failure is always an exception here: the page must never read a broken
+    // service as "Everroot has nothing to suggest".
+    throw new Error(
+      res.status === 429
+        ? 'The AI service is busy right now. Please try again in a moment.'
+        : res.status >= 500
+          ? 'Tree suggestions are unavailable right now. Please try again.'
+          : `The suggestion request was rejected (${res.status}).`
+    );
+  }
+  const data = (await res.json()) as Partial<RecommendationsResponse>;
+  const followUpQuestion = typeof data.followUpQuestion === 'string' ? data.followUpQuestion.trim() : '';
+  return {
+    status: data.status ?? 'ok',
+    suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+    evidence: data.evidence ?? emptyEvidence(),
+    promptVersion: data.promptVersion ?? '',
+    model: data.model ?? '',
+    disclaimer: data.disclaimer ?? '',
+    // Trimmed here so a model that padded it with whitespace cannot render a
+    // blank question on the results page.
+    ...(followUpQuestion ? { followUpQuestion } : {}),
   };
 }
 

@@ -397,6 +397,47 @@ var intentionLabels = map[string]string{
 	"explore":  "open curiosity, nothing personal shared",
 }
 
+// associationStatus reports what Everroot's publication gate says about one
+// selection: a tradition, a region and a Nakshatra.
+//
+// selectable is false only when the selection names a tradition or a Nakshatra
+// Everroot does not carry at all — a choice the interface should never have
+// been able to offer. Everything else is a verdict rather than a failure:
+// "reviewed_match" only when a published, rights-cleared revision backs it, and
+// "no_reviewed_match" when the records simply do not cover this selection. A
+// database that cannot be read lands in the same place, because neither of them
+// is a match — the two are still told apart in the log, and neither is ever
+// invented.
+//
+// The explanation and the recommendation handlers share this predicate on
+// purpose: it is what stops anything else from claiming a cultural match that
+// the discovery endpoint would deny.
+func (a *API) associationStatus(ctx context.Context, tradition, region, nakshatra string) (state string, selectable bool) {
+	if tradition == "" || nakshatra == "" {
+		return assocNotQueryable, true
+	}
+	if a.db == nil {
+		return assocNoReviewedMatch, true
+	}
+	var supported bool
+	if err := a.db.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id = t.culture_id
+			              WHERE t.slug = $1 AND t.status = 'active' AND c.status = 'active')
+			   AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name) = lower($2))`,
+		tradition, nakshatra).Scan(&supported); err != nil {
+		a.log.Warn("database query failed for tradition check", "error", err)
+		return assocNoReviewedMatch, true
+	}
+	if !supported {
+		return "", false
+	}
+	var matched bool
+	if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, tradition, nakshatra, region).Scan(&matched); err == nil && matched {
+		return assocReviewedMatch, true
+	}
+	return assocNoReviewedMatch, true
+}
+
 type explainRequest struct {
 	Intention string `json:"intention"`
 	Tradition string `json:"tradition"`
@@ -455,32 +496,10 @@ func (a *API) explain(w http.ResponseWriter, r *http.Request) {
 		species = loaded
 	}
 
-	association := assocNotQueryable
-	if req.Tradition != "" && req.Nakshatra != "" {
-		if a.db != nil {
-			var supported bool
-			if err := a.db.QueryRow(ctx, `
-				SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id = t.culture_id
-				              WHERE t.slug = $1 AND t.status = 'active' AND c.status = 'active')
-				   AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name) = lower($2))`,
-				req.Tradition, req.Nakshatra).Scan(&supported); err == nil {
-				if !supported {
-					writeError(w, 400, "unsupported tradition or Nakshatra")
-					return
-				}
-				var matched bool
-				if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, req.Tradition, req.Nakshatra, req.Region).Scan(&matched); err == nil && matched {
-					association = assocReviewedMatch
-				} else {
-					association = assocNoReviewedMatch
-				}
-			} else {
-				a.log.Warn("database query failed for tradition check", "error", err)
-				association = assocNoReviewedMatch
-			}
-		} else {
-			association = assocNoReviewedMatch
-		}
+	association, selectable := a.associationStatus(ctx, req.Tradition, req.Region, req.Nakshatra)
+	if !selectable {
+		writeError(w, 400, "unsupported tradition or Nakshatra")
+		return
 	}
 
 	notOnRecord := []string{}

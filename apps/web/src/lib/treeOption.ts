@@ -13,6 +13,7 @@ import type {
   BotanicalCandidate,
   DiscoverySource,
   Recommendation,
+  RecommendationSuggestion,
   TreeFact,
 } from './discovery';
 import { validURL } from './discovery';
@@ -78,6 +79,22 @@ export const REFERENCE_GAPS = [
   'Habitat and native range — no reviewed record',
   'Ecological role — no reviewed record',
   'Documented cultural or historical stories — no reviewed record',
+];
+
+/** What an AI suggestion is, stated on the card itself and never softened. */
+export const SUGGESTION_RULE =
+  'Chosen for you from your answers and general growing knowledge — written for your situation, not read from a reviewed record.';
+
+/**
+ * What a suggestion does not have. The absence of a source is the first thing
+ * on the list because it is the one difference between this card and a record
+ * Everroot could stand behind. The wording states the gap plainly without
+ * arguing with the visitor about the choice they just made.
+ */
+export const SUGGESTION_GAPS = [
+  'Source — none: written for you, not quoted from a reviewed record',
+  'Cultural association — only a reviewed Everroot record can state one',
+  'Habitat, native range and ecological role — no reviewed record',
 ];
 
 export function titleCase(value: string): string {
@@ -187,14 +204,18 @@ export function sourceTags(source: DiscoverySource): string[] {
 /**
  * One sentence about the cultural side, taken from the server's own publication
  * gate rather than guessed here.
+ *
+ * The unverified cases are stated as an absence of a record, never as a denial
+ * of the tradition the visitor chose: they picked it in good faith, and the
+ * sentence exists to explain what Everroot does not hold, not to argue.
  */
 export function culturalNote(verified: boolean, state: string): string {
   if (verified) return 'Reviewed and published against the sources listed below.';
   switch (state) {
     case 'no_reviewed_match':
-      return 'Checked against Everroot’s reviewed cultural dataset: no record for this selection.';
+      return 'Everroot holds no reviewed record for this combination yet, so nothing cultural is claimed either way.';
     case 'not_queryable':
-      return 'Your answers are not part of Everroot’s reviewed cultural dataset, so no cultural match was checked.';
+      return 'You did not pick a tradition or Nakshatra, so there was no cultural record to look up.';
     default:
       return 'Everroot has not verified a cultural association for this option.';
   }
@@ -270,6 +291,63 @@ export function referenceOption(
     gaps: REFERENCE_GAPS,
     sources,
     tree,
+    referenceHref: '/trees',
+    referenceLabel: 'Open the tree reference',
+  };
+}
+
+export function suggestionOption(
+  suggestion: RecommendationSuggestion,
+  index: number,
+  scope: string,
+  associationState = ''
+): TreeOptionView {
+  const scientificName = suggestion.scientificName ?? '';
+  // Only call the title botanical when the name and the binomial are the same
+  // string: a model that offered no binomial has offered a name, not an identity.
+  const titleIsScientific = Boolean(scientificName) && scientificName === suggestion.name;
+
+  const facts: OptionFact[] = [];
+  if (scientificName && !titleIsScientific) {
+    facts.push({ label: 'Scientific name', value: scientificName });
+  }
+  if (suggestion.botanicalDetail) facts.push({ label: 'About', value: suggestion.botanicalDetail });
+  // Mature size decides whether a suggestion is even possible in the visitor's
+  // space, so it sits above the care notes rather than among them. A model that
+  // said "not sure" is showing the same honesty the card asks of it.
+  const matureSize = (suggestion.matureSize ?? '').trim();
+  if (matureSize) facts.push({ label: 'Mature size', value: matureSize });
+  for (const requirement of suggestion.growingRequirements ?? []) {
+    facts.push({ label: 'Growing', value: requirement });
+  }
+  for (const limitation of suggestion.limitations ?? []) {
+    facts.push({ label: 'Watch out', value: limitation });
+  }
+
+  // The model may explain a cultural request Everroot could not answer, and
+  // that is the only version of this note it is ever allowed to write: it
+  // restates a verdict the server computed, rather than forming one. When it
+  // wrote nothing — or was never asked — the server's own sentence stands.
+  const modelNote = (suggestion.culturalNote ?? '').trim();
+
+  return {
+    key: `${scope}-suggestion-${index}`,
+    title: suggestion.name,
+    titleIsScientific,
+    mark: (suggestion.name || '?').charAt(0).toUpperCase(),
+    scientificName,
+    authorship: '',
+    tags: [{ text: 'AI-generated suggestion', tone: 'pending' }],
+    whyIncluded: suggestion.whyItMatches,
+    culturalNote: modelNote || culturalNote(false, associationState),
+    culturalVerified: false,
+    facts,
+    otherNames: [],
+    gaps: SUGGESTION_GAPS,
+    // A generated idea has nothing to cite, and that is shown rather than
+    // patched over with an authority record belonging to a different tree.
+    sources: [],
+    tree: null,
     referenceHref: '/trees',
     referenceLabel: 'Open the tree reference',
   };

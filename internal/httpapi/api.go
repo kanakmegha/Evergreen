@@ -25,14 +25,15 @@ type questionAnswerer interface {
 }
 
 type API struct {
-	db        *pgxpool.Pool
-	log       *slog.Logger
-	mux       *http.ServeMux
-	aiClient  *ai.Client
-	qa        questionAnswerer
-	convMgr   *conversation.Manager
-	catalogue treeSource
-	explainer explainer
+	db          *pgxpool.Pool
+	log         *slog.Logger
+	mux         *http.ServeMux
+	aiClient    *ai.Client
+	qa          questionAnswerer
+	convMgr     *conversation.Manager
+	catalogue   treeSource
+	explainer   explainer
+	recommender recommender
 }
 
 func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
@@ -60,6 +61,7 @@ func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
 	if aiClient != nil {
 		a.qa = aiClient
 		a.explainer = aiClient
+		a.recommender = aiClient
 	}
 	a.routes()
 	return a.requestID(a.cors(a.mux)), nil
@@ -72,6 +74,7 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /api/v1/nakshatras", a.nakshatras)
 	a.mux.HandleFunc("GET /api/v1/trees", a.trees)
 	a.mux.HandleFunc("POST /api/v1/discoveries", a.discover)
+	a.mux.HandleFunc("POST /api/v1/recommendations", a.recommend)
 	a.mux.HandleFunc("POST /api/v1/explain", a.explain)
 	a.mux.HandleFunc("POST /api/v1/questions", a.askQuestion)
 	a.mux.HandleFunc("POST /api/v1/ask", a.askQuestion)

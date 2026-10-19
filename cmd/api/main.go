@@ -165,11 +165,12 @@ func warmDatabase(pool *pgxpool.Pool, logger *slog.Logger) {
 }
 
 // writeTimeout bounds how long the server will spend answering one request. It
-// must exceed the AI provider timeout, because /api/v1/explain and
-// /api/v1/questions answer inside the request: a shorter write deadline kills
-// the connection mid-answer, and the browser receives no response at all
-// instead of a slow one.
-func writeTimeout() time.Duration { return ai.ProviderTimeout + 20*time.Second }
+// must exceed the AI provider's worst case, because /api/v1/recommendations,
+// /api/v1/explain and /api/v1/questions answer inside the request: a shorter
+// write deadline kills the connection mid-answer, and the browser receives no
+// response at all instead of a slow one — so a provider that timed out and
+// recovered on a retry looked like a service that could not be reached.
+func writeTimeout() time.Duration { return ai.WorstCaseResponseTime + 20*time.Second }
 
 func main() {
 	loadDotEnv(".env")
