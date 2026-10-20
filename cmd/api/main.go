@@ -118,6 +118,11 @@ func connectPool(logger *slog.Logger) *pgxpool.Pool {
 	// Neon serverless compute suspends when idle; MinConns: 0 allows scale-to-zero.
 	cfg.MinConns = 0
 	cfg.ConnConfig.ConnectTimeout = connectTimeout()
+	// Restrict the dial to IPv4 while leaving cfg.ConnConfig.Host untouched, so
+	// TLS verification and SNI keep using the hostname. pgx.ConnConfig embeds
+	// pgconn.Config, and the dialer, host and TLS settings all live in the
+	// embedded struct, so that is what the helper takes. See dbhealth.ApplyIPv4Dial.
+	dbhealth.ApplyIPv4Dial(&cfg.ConnConfig.Config, connectTimeout())
 	if maxConns := os.Getenv("DATABASE_MAX_CONNS"); maxConns != "" {
 		if n, err := strconv.Atoi(maxConns); err == nil && n > 0 {
 			cfg.MaxConns = int32(n)

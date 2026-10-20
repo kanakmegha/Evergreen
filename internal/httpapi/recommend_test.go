@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -140,6 +141,69 @@ func TestRecommendationsServeAnyIntentionWithoutADatabaseOrCatalogue(t *testing.
 	}
 	if len(stub.got.Picks) != 1 {
 		t.Fatalf("picks = %v", stub.got.Picks)
+	}
+}
+
+// TestUnregisteredTraditionIsNeverRejected is the behaviour change the brief
+// asks for, stated at the boundary. This endpoint used to answer 400 whenever
+// the tradition named was not one Everroot carries, which turned "nobody has
+// reviewed this combination" into a refusal to help. The visitor picked a real
+// tradition; the honest reply is a suggestion beside an honest "no reviewed
+// record", not an error.
+func TestUnregisteredTraditionIsNeverRejected(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{
+			name: "a tradition the registry has never heard of",
+			body: `{"intention":"culture","tradition":"Sikh","nakshatra":"Ashwini","answer":"Trees my family grew up beside."}`,
+		},
+		{
+			name: "a region with no record",
+			body: `{"intention":"explore","tradition":"Sikh","region":"Punjab","nakshatra":"Ashwini","answer":"Anything that suits the climate."}`,
+		},
+		{
+			name: "a Nakshatra that is not in the registry",
+			body: `{"intention":"explore","tradition":"nakshatra-tree-association","nakshatra":"Moola","answer":"I want to understand what is recorded."}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRecommender{result: stubSuggestions("Neem")}
+			w, body := postRecommendations(t, stub, tc.body, io.Discard)
+
+			if w.Code == http.StatusBadRequest {
+				t.Fatalf("status = 400, body = %s: an unregistered tradition must not be a rejection", w.Body.String())
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			if got := suggestionsOf(t, body); len(got) == 0 {
+				t.Error("no suggestions returned for a tradition Everroot does not carry")
+			}
+			if got := evidenceOf(t, body)["culturalAssociation"]; got != "no_reviewed_match" {
+				t.Errorf("culturalAssociation = %v, want no_reviewed_match", got)
+			}
+		})
+	}
+}
+
+// TestRecommendationsRefuseNothingOnCulturalInput is the static half of the
+// same proof. The registry-support predicate and the rejection it fed are gone
+// from this handler; if either comes back, so does the 400.
+func TestRecommendationsRefuseNothingOnCulturalInput(t *testing.T) {
+	src, err := os.ReadFile("recommend.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	body := string(src)
+	for _, banned := range []string{
+		"unsupported tradition or Nakshatra",
+		"t.status = 'active'",
+	} {
+		if strings.Contains(body, banned) {
+			t.Errorf("recommend.go still references %q; a tradition is context, not a precondition", banned)
+		}
+	}
+	if !strings.Contains(body, "association := a.associationStatus") {
+		t.Error("recommend.go no longer records the publication verdict; the two must not drift apart")
 	}
 }
 

@@ -142,13 +142,13 @@ func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	// The publication gate answers the cultural half of the reply. It is the
 	// same predicate the explanation and discovery endpoints use, so a
 	// suggestion can never be shown beside a cultural claim Track A would deny.
-	// A tradition Everroot does not carry is a selection the caller could not
-	// legitimately have made, which is the one case worth rejecting.
-	association, selectable := a.associationStatus(ctx, req.Tradition, req.Region, req.Nakshatra)
-	if !selectable {
-		writeError(w, 400, "unsupported tradition or Nakshatra")
-		return
-	}
+	//
+	// It reports a verdict and refuses nothing. A tradition Everroot does not
+	// carry used to make this endpoint answer 400, which turned "nobody has
+	// reviewed this combination" into a refusal to help — the visitor picked a
+	// real tradition, and the honest reply is a suggestion beside an honest
+	// "no reviewed record", not an error.
+	association := a.associationStatus(ctx, req.Tradition, req.Region, req.Nakshatra)
 
 	result, err := a.recommender.SuggestTrees(ctx, ai.RecommendInput{
 		IntentionID:       req.Intention,

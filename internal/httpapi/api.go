@@ -55,7 +55,6 @@ func New(db *pgxpool.Pool, log *slog.Logger, revision string) (http.Handler, err
 		log:       log,
 		mux:       http.NewServeMux(),
 		aiClient:  aiClient,
-		convMgr:   conversation.New(db, aiClient, log),
 		catalogue: cat,
 		revision:  revision,
 	}
@@ -63,11 +62,23 @@ func New(db *pgxpool.Pool, log *slog.Logger, revision string) (http.Handler, err
 	// a typed nil would make `a.qa == nil` false, so the "not configured" guard
 	// in askQuestion would never fire and an unconfigured deployment would
 	// report a misleading "temporarily unavailable" error instead.
+	//
+	// The conversation's recommender is guarded for the same reason: a typed
+	// nil there would make its own nil check impossible, and an unconfigured
+	// deployment would answer a visitor with an empty list instead of an honest
+	// "the engine is not reachable from here".
+	var convRecommender conversation.Recommender
 	if aiClient != nil {
 		a.qa = aiClient
 		a.explainer = aiClient
 		a.recommender = aiClient
+		convRecommender = aiClient
 	}
+	// The cultural gate is this handler: it owns the publication predicate, and
+	// injecting it here is what lets the conversation annotate a reply without
+	// calling the API back over the loopback interface. It only ever reports a
+	// verdict — the conversation offers suggestions whatever it says.
+	a.convMgr = conversation.New(db, aiClient, convRecommender, a, log)
 	a.routes()
 	return a.requestID(a.cors(a.mux)), nil
 }

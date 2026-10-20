@@ -400,42 +400,49 @@ var intentionLabels = map[string]string{
 // associationStatus reports what Everroot's publication gate says about one
 // selection: a tradition, a region and a Nakshatra.
 //
-// selectable is false only when the selection names a tradition or a Nakshatra
-// Everroot does not carry at all — a choice the interface should never have
-// been able to offer. Everything else is a verdict rather than a failure:
-// "reviewed_match" only when a published, rights-cleared revision backs it, and
-// "no_reviewed_match" when the records simply do not cover this selection. A
-// database that cannot be read lands in the same place, because neither of them
-// is a match — the two are still told apart in the log, and neither is ever
-// invented.
+// It reports; it does not gate. A selection naming a tradition Everroot does
+// not carry is not a reason to refuse a visitor a suggestion — it is the reason
+// the reply has to say that no reviewed record backs it. The verdict travels
+// two ways from here and never gets recomputed: into the prompt, as the model's
+// only licence to mention verification, and into the response as
+// evidence.culturalAssociation, so what the visitor reads and what the model
+// was told can never disagree.
+//
+// "reviewed_match" is returned only when a published, rights-cleared revision
+// backs the selection. "no_reviewed_match" means the records simply do not
+// cover it — whether because nobody has reviewed this combination or because
+// the tradition is not one Everroot carries at all, which are the same fact
+// from the visitor's side and are told apart only in the log. A database that
+// cannot be read lands in the same place, because none of these is a match, and
+// none of them is ever invented.
 //
 // The explanation and the recommendation handlers share this predicate on
-// purpose: it is what stops anything else from claiming a cultural match that
-// the discovery endpoint would deny.
-func (a *API) associationStatus(ctx context.Context, tradition, region, nakshatra string) (state string, selectable bool) {
+// purpose: it is what stops either from claiming a cultural match that the
+// discovery endpoint would deny.
+func (a *API) associationStatus(ctx context.Context, tradition, region, nakshatra string) string {
 	if tradition == "" || nakshatra == "" {
-		return assocNotQueryable, true
+		return assocNotQueryable
 	}
 	if a.db == nil {
-		return assocNoReviewedMatch, true
-	}
-	var supported bool
-	if err := a.db.QueryRow(ctx, `
-			SELECT EXISTS(SELECT 1 FROM traditions t JOIN cultures c ON c.id = t.culture_id
-			              WHERE t.slug = $1 AND t.status = 'active' AND c.status = 'active')
-			   AND EXISTS(SELECT 1 FROM nakshatras WHERE lower(canonical_name) = lower($2))`,
-		tradition, nakshatra).Scan(&supported); err != nil {
-		a.log.Warn("database query failed for tradition check", "error", err)
-		return assocNoReviewedMatch, true
-	}
-	if !supported {
-		return "", false
+		return assocNoReviewedMatch
 	}
 	var matched bool
-	if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, tradition, nakshatra, region).Scan(&matched); err == nil && matched {
-		return assocReviewedMatch, true
+	if err := a.db.QueryRow(ctx, reviewedAssociationExistsSQL, tradition, nakshatra, region).Scan(&matched); err != nil {
+		a.log.Warn("database query failed for the reviewed association check", "error", err)
+		return assocNoReviewedMatch
 	}
-	return assocNoReviewedMatch, true
+	if matched {
+		return assocReviewedMatch
+	}
+	return assocNoReviewedMatch
+}
+
+// AssociationVerdict is the conversation manager's window onto the same
+// publication gate. It is exported, and takes no part in any decision to refuse
+// a visitor anything: the conversation offers suggestions whatever the verdict
+// is, and prints the verdict beside them.
+func (a *API) AssociationVerdict(ctx context.Context, tradition, region, nakshatra string) string {
+	return a.associationStatus(ctx, tradition, region, nakshatra)
 }
 
 type explainRequest struct {
@@ -489,18 +496,21 @@ func (a *API) explain(w http.ResponseWriter, r *http.Request) {
 	} else if a.catalogue != nil {
 		loaded, err := a.catalogue.List(ctx, "", exploreGroundingSize, 0)
 		if err != nil {
-			a.log.Error("catalogue read failed", "request_id", r.Header.Get("X-Request-ID"), "error", err)
-			writeError(w, 503, "botanical catalogue unavailable")
-			return
+			// A general explanation is about the visitor's own intention and
+			// cultural context. The catalogue grounds it when it can be read
+			// and is reported as absent when it cannot, but it is not a gate in
+			// front of the model: refusing to answer here would make a database
+			// outage look like the visitor had asked something unanswerable.
+			// botanicalIdentityStatus reports "unavailable" for an empty set, so
+			// the reply still says which half of it Everroot could not supply.
+			a.log.Warn("catalogue read failed; explaining without botanical grounding",
+				"request_id", r.Header.Get("X-Request-ID"), "error", err)
+		} else {
+			species = loaded
 		}
-		species = loaded
 	}
 
-	association, selectable := a.associationStatus(ctx, req.Tradition, req.Region, req.Nakshatra)
-	if !selectable {
-		writeError(w, 400, "unsupported tradition or Nakshatra")
-		return
-	}
+	association := a.associationStatus(ctx, req.Tradition, req.Region, req.Nakshatra)
 
 	notOnRecord := []string{}
 	if association != assocReviewedMatch {

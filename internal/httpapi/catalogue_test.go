@@ -372,12 +372,92 @@ func TestTreesEndpointReportsOutage(t *testing.T) {
 	}
 }
 
-func TestExplainReportsOutageSeparatelyFromEmptyCatalogue(t *testing.T) {
+// TestGeneralExplanationSurvivesACatalogueOutage replaces an assertion that a
+// readable catalogue was a precondition for answering. It was not: a general
+// explanation is about the visitor's own intention and cultural context, and
+// turning a database outage into a 503 made a broken connection look like the
+// visitor had asked something unanswerable. The outage is still reported —
+// plainly, in the evidence panel — it just no longer silences the model.
+func TestGeneralExplanationSurvivesACatalogueOutage(t *testing.T) {
 	h := newShimmedAPI(stubTreeSource{err: errors.New("connection reset")}, &stubExplainer{})
-	w, _ := postExplain(t, h, `{"intention":"explore"}`)
-	if w.Code != 503 {
-		t.Fatalf("status=%d want 503", w.Code)
+	w, body := postExplain(t, h, `{"intention":"explore"}`)
+	if w.Code != 200 {
+		t.Fatalf("status=%d want 200: an unreadable catalogue must not block a general explanation", w.Code)
 	}
+	evidence, _ := body["evidence"].(map[string]any)
+	if evidence == nil {
+		t.Fatalf("no evidence object in %s", w.Body.String())
+	}
+	if got := evidence["botanicalIdentity"]; got != "unavailable" {
+		t.Errorf("botanicalIdentity=%v, want \"unavailable\": the outage must be stated, not hidden", got)
+	}
+	if got := evidence["habitat"]; got != "no_reviewed_record" {
+		t.Errorf("habitat=%v, want \"no_reviewed_record\"", got)
+	}
+}
+
+// TestGeneralExplanationNeedsNoCatalogueAtAll covers the other half: a
+// deployment with no catalogue configured at all still explains.
+func TestGeneralExplanationNeedsNoCatalogueAtAll(t *testing.T) {
+	h := newShimmedAPI(nil, &stubExplainer{})
+	w, _ := postExplain(t, h, `{"intention":"explore","tradition":"Sikh","nakshatra":"Ashwini"}`)
+	if w.Code != 200 {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+}
+
+// TestExplainForARegisteredSpeciesStillValidates keeps the distinction the
+// brief asks for. Naming a species is a factual claim about a record, so it is
+// still checked: an unknown one is a 404, and an unreadable catalogue is still
+// a 503, because "I could not look it up" and "there is no such record" are
+// different answers and only one of them may be given by guessing.
+func TestExplainForARegisteredSpeciesStillValidates(t *testing.T) {
+	t.Run("unknown species is a 404", func(t *testing.T) {
+		h := newShimmedAPI(stubTreeSource{facts: []treeFact{{SpeciesID: "azadirachta-indica"}}}, &stubExplainer{})
+		w, _ := postExplain(t, h, `{"intention":"explore","speciesId":"quercus-robur"}`)
+		if w.Code != 404 {
+			t.Fatalf("status=%d want 404", w.Code)
+		}
+	})
+
+	t.Run("unreadable catalogue is a 503", func(t *testing.T) {
+		h := newShimmedAPI(stubTreeSource{err: errors.New("connection reset")}, &stubExplainer{})
+		w, _ := postExplain(t, h, `{"intention":"explore","speciesId":"azadirachta-indica"}`)
+		if w.Code != 503 {
+			t.Fatalf("status=%d want 503: a named species cannot be validated against an unreadable record", w.Code)
+		}
+	})
+
+	t.Run("a known species is answered", func(t *testing.T) {
+		h := newShimmedAPI(stubTreeSource{facts: []treeFact{{SpeciesID: "azadirachta-indica", AcceptedName: "Azadirachta indica"}}}, &stubExplainer{})
+		w, _ := postExplain(t, h, `{"intention":"explore","speciesId":"azadirachta-indica"}`)
+		if w.Code != 200 {
+			t.Fatalf("status=%d want 200", w.Code)
+		}
+	})
+}
+
+// TestExplainNeverClaimsAReviewItDoesNotHold is the guardrail that survives the
+// change: an unregistered tradition may now be explained, but nothing in the
+// reply may present that as a reviewed cultural association.
+func TestExplainNeverClaimsAReviewItDoesNotHold(t *testing.T) {
+	h := newShimmedAPI(nil, &stubExplainer{})
+	_, body := postExplain(t, h, `{"intention":"explore","tradition":"Sikh","nakshatra":"Ashwini"}`)
+	evidence, _ := body["evidence"].(map[string]any)
+	if evidence == nil {
+		t.Fatalf("no evidence object in %s", w(body))
+	}
+	if got := evidence["culturalAssociation"]; got == "reviewed_match" {
+		t.Error("an unregistered tradition was reported as a reviewed match")
+	}
+	if got := evidence["culturalAssociation"]; got != "no_reviewed_match" {
+		t.Errorf("culturalAssociation=%v, want \"no_reviewed_match\"", got)
+	}
+}
+
+func w(body map[string]any) string {
+	raw, _ := json.Marshal(body)
+	return string(raw)
 }
 
 /* ---------------------------------------------------- prompt guardrails */

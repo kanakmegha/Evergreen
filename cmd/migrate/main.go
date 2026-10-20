@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"everroot/internal/dbhealth"
 )
 
 // MigrationAdvisoryLockKey is a unique 64-bit key used to coordinate concurrent
@@ -176,6 +178,15 @@ func main() {
 		logger.Error("Failed to parse database connection URL (ensure format is postgres://...)")
 		os.Exit(1)
 	}
+
+	// Restrict the dial to IPv4 so the migrator can reach the endpoint at all;
+	// this is the same host the API and the health checker use. cfg.Host is left
+	// untouched so TLS verification and SNI keep using the hostname — the
+	// dialer, host and TLS settings all live in the embedded pgconn.Config, so
+	// that is what the helper takes. The timeout is carried over from the parsed
+	// config rather than invented here, because this command bounds the whole
+	// attempt with the context below.
+	dbhealth.ApplyIPv4Dial(&connCfg.Config, connCfg.ConnectTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

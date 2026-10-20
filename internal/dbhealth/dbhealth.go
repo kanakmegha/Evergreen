@@ -390,6 +390,10 @@ func Probe(ctx context.Context, dsn string, connectTimeout time.Duration) Report
 		}
 	}
 	cfg.ConnectTimeout = connectTimeout
+	// The dial is restricted to IPv4; cfg.Host is deliberately left as parsed
+	// because pgx derives TLS verification and SNI from it, not from the address
+	// it dialed. See ApplyIPv4Dial.
+	ApplyIPv4Dial(&cfg.Config, connectTimeout)
 
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

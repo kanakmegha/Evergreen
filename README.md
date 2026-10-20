@@ -182,6 +182,7 @@ The backend is a listening HTTP server, not a serverless function. It reads the 
 | `DATABASE_URL` | Backend | Yes, for the reviewed catalogue | PostgreSQL connection (Neon: use the **pooled** endpoint with `sslmode=require`). The nakshatra, tradition, region and tree catalogue and interaction persistence all read it. **The AI answer path does not**: `/api/v1/questions` answers from the model alone. |
 | `DIRECT_URL` | — | No | The **direct** (unpooled) endpoint. Used only by `cmd/migrate`, never by the server, because the migration runner holds a session-level advisory lock. |
 | `DATABASE_CONNECT_TIMEOUT` | Backend | No | Bound on one connection attempt (default `10s`). Raise it if Neon cold starts exceed the default. |
+| `DATABASE_FORCE_IPV4` | Backend | No | Dial PostgreSQL over IPv4 only (default on). The endpoint is reachable over IPv4 but its IPv6 route does not answer, so a dual-stack dial spends the connect budget on addresses that never respond and times out. Set to `false` only on a network where IPv6 is the working path. The hostname is still used for TLS verification and SNI; only the dial is restricted. |
 | `HF_TOKEN` | Backend | To answer questions | Hugging Face credentials. Never commit it, and never expose it to the browser. |
 | `HF_MODEL_ID`, `HF_BASE_URL` | Backend | No | Optional provider overrides. Leave `HF_MODEL_ID` unset to use the default, un-suffixed identifier; a provider or policy suffix such as `:cheapest` pins one provider and gives up the router's automatic failover. |
 | `WEB_ORIGIN` | Backend | Only for a split origin | Comma-separated list of web origins allowed to call this API. See below. |
@@ -238,7 +239,7 @@ A 503 is a database problem, not a code problem, but "the database" covers sever
 | `malformed_dsn` | The connection string cannot be parsed | Re-copy it from the Neon dashboard |
 | `dns` | The hostname does not resolve | The endpoint is wrong, or the project or branch was deleted |
 | `connection_refused` | The host exists but is not accepting connections | Check the port; the Neon compute may be suspended or disabled |
-| `timeout` | The attempt ran out of time (often a Neon cold start) | Retry; raise `DATABASE_CONNECT_TIMEOUT` if it recurs |
+| `timeout` | The attempt ran out of time | Retry; raise `DATABASE_CONNECT_TIMEOUT` if it recurs. If it never connects but `nc -4` to the host succeeds, leave `DATABASE_FORCE_IPV4` on — see the variable table above. |
 | `tls` | TLS negotiation failed | Neon requires TLS: keep `sslmode=require` on `DATABASE_URL` |
 | `authentication` (`28…`) | The role or password was rejected | Re-copy the connection string; the password may have been rotated |
 | `unknown_database` (`3D000`) | The named database does not exist on this branch | Re-copy the connection string |
