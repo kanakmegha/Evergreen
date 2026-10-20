@@ -123,7 +123,7 @@ All claims or names entered through this interface are editorial inputs and need
 
 ## API contract
 
-The OpenAPI contract is in [`api/openapi.yaml`](api/openapi.yaml). Public endpoints provide traditions, the Nakshatra vocabulary, and source-backed discovery. Internal endpoints are local-only and protected by Go middleware. Health and readiness endpoints are `/healthz` and `/readyz`.
+The OpenAPI contract is in [`api/openapi.yaml`](api/openapi.yaml). Public endpoints provide traditions, the Nakshatra vocabulary, and source-backed discovery. Internal endpoints are local-only and protected by Go middleware. Health and readiness endpoints are `GET /healthz` and `GET /readyz`.
 
 ### Answering a question
 
@@ -248,7 +248,9 @@ A 503 is a database problem, not a code problem, but "the database" covers sever
 
 Connection and schema are different failures. `Ping` succeeds against a reachable, authenticated database even when it is empty, so a missing schema never appears as "the database is unreachable". The backend logs the target (host, port, database, user, and whether a password is set — never the password itself) and the classification.
 
-`/healthz` returns 200 whenever the process is up; `/readyz` returns 503 when PostgreSQL cannot be reached at all. That separates "the API is running" from "the database answers".
+`/healthz` returns 200 with a small JSON body — `{"status":"ok","service":"everroot-api","revision":"<git sha>"}` — whenever the process is up. It reads neither PostgreSQL nor the AI provider, because a deployment must be able to say "I am running" even while everything it depends on is down. The `revision` is injected at build time by the root `vercel.json` build command (`go build -ldflags "-X main.revision=${VERCEL_GIT_COMMIT_SHA:-unknown}" -o server ./cmd/api`), falling back to the platform's build metadata and then to the literal `unknown` — it is never guessed. The ldflags symbol is `main.revision`, not the full import path: for package main the linker matches by the package name, and a full import path is silently ignored, which would report "unknown" on every probe while looking correctly configured.
+
+`/readyz` returns 503 when PostgreSQL cannot be reached at all. That separates "the API is running" from "the database answers". On the split-origin deployment both paths are routed to the Go service by the root `vercel.json` rewrites, so a health response that arrives as HTML means the request was answered by the web app instead of the API — a routing problem, not a health problem.
 
 ### If an AI question returns 429 or 503
 
@@ -314,7 +316,7 @@ If both are served from one domain, set `PUBLIC_API_SAME_ORIGIN=true` on the fro
 
 1. Apply migrations to the database (manual, once per schema change). Verify with `go run ./cmd/dbcheck DIRECT_URL` — it must report `reachable=true schema_present=true`.
 2. Deploy the backend, with `DATABASE_URL`, `HF_TOKEN` and (for split origins) `WEB_ORIGIN` set. Remove any `API_ADDR` left over from local development.
-3. Verify the backend directly: `/healthz` should be 200, `/readyz` 200, and `/api/v1/nakshatras` should be 200 with 27 entries (not 503, not 500). If a catalogue endpoint returns 503, the log line names the `category`; see *If the reviewed catalogue returns 503* above.
+3. Verify the backend directly: `GET /healthz` should be 200 JSON whose `revision` equals the commit that was deployed, `GET /readyz` should be 200, and `GET /api/v1/nakshatras` should be 200 with 27 entries (not 503, not 500). If a catalogue endpoint returns 503, the log line names the `category`; see *If the reviewed catalogue returns 503* above.
 4. Set `PUBLIC_API_URL` on the frontend if the origins differ, or `PUBLIC_API_SAME_ORIGIN=true` for a production single-origin deployment.
 5. Deploy the frontend last, so the build picks up `PUBLIC_API_URL`.
 

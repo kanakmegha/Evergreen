@@ -32,7 +32,7 @@ func TestAdminRoutesFailClosed(t *testing.T) {
 	t.Setenv("ADMIN_REVIEWER_ID", "")
 	t.Setenv("ADMIN_REVIEWER_ROLE", "")
 	t.Setenv("HF_TOKEN", "test-token")
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestAdminRoutesFailClosed(t *testing.T) {
 // production), so an unset WEB_ORIGIN must not grant anything — otherwise any
 // site could drive the paid model calls behind /api/v1/questions.
 func TestCORSIsOptIn(t *testing.T) {
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestCORSIsOptIn(t *testing.T) {
 // The preflight must succeed for an allowed origin and must not be granted for
 // any other, and it must never reach the router (which only knows GET/POST).
 func TestCORSPreflight(t *testing.T) {
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestCORSPreflight(t *testing.T) {
 // a reviewed record and implies Everroot checked something it had not.
 func TestReviewedCatalogueIsUnavailableWithoutDatabase(t *testing.T) {
 	t.Setenv("HF_TOKEN", "test-token")
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestCatalogueFailureLogsAreCredentialFree(t *testing.T) {
 	defer pool.Close()
 
 	var logs bytes.Buffer
-	h, err := New(pool, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(pool, slog.New(slog.NewTextHandler(&logs, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestCatalogueFailureLogsAreCredentialFree(t *testing.T) {
 
 func TestPublicDiscoveryRequiresKnownValidInput(t *testing.T) {
 	t.Setenv("HF_TOKEN", "test-token")
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestPostgresDiscoveryAndReviewWorkflow(t *testing.T) {
 	if err = pool.Ping(ctx); err != nil {
 		t.Fatal(err)
 	}
-	api, err := New(pool, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	api, err := New(pool, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test-revision")
 	if err != nil {
 		t.Fatal(err)
 	}

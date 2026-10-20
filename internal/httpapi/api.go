@@ -34,9 +34,13 @@ type API struct {
 	catalogue   treeSource
 	explainer   explainer
 	recommender recommender
+	// revision is the build this process was made from. It is reported by
+	// /healthz so a deployment can be matched to a commit without trusting a
+	// dashboard, and it is never invented when it is unknown.
+	revision string
 }
 
-func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
+func New(db *pgxpool.Pool, log *slog.Logger, revision string) (http.Handler, error) {
 	aiClient, err := ai.New(log)
 	if err != nil {
 		log.Warn("ai layer is not configured", "reason", err)
@@ -53,6 +57,7 @@ func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
 		aiClient:  aiClient,
 		convMgr:   conversation.New(db, aiClient, log),
 		catalogue: cat,
+		revision:  revision,
 	}
 	// Only store the AI client in the interfaces when it really exists. Storing
 	// a typed nil would make `a.qa == nil` false, so the "not configured" guard
@@ -67,7 +72,11 @@ func New(db *pgxpool.Pool, log *slog.Logger) (http.Handler, error) {
 	return a.requestID(a.cors(a.mux)), nil
 }
 func (a *API) routes() {
-	a.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	// /healthz is the liveness endpoint, and it is spelled the way README and
+	// the deployment rewrites already spell it: adding a second name for the
+	// same answer would leave two paths to document, probe and keep in step,
+	// for no behaviour a caller could observe.
+	a.mux.HandleFunc("GET /healthz", a.health)
 	a.mux.HandleFunc("GET /readyz", a.ready)
 	a.mux.HandleFunc("GET /api/v1/traditions", a.traditions)
 	a.mux.HandleFunc("GET /api/v1/traditions/{tradition}/regions", a.regions)
@@ -150,6 +159,34 @@ func (a *API) requestID(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// health is liveness: this process is up and serving HTTP. It reads nothing and
+// waits for nothing — not the database, not the AI provider — because a
+// deployment must be able to say "I am running" even while everything it depends
+// on is down. /readyz is where those dependencies are reported, and a caller
+// that needs them must ask there rather than infer them from a failed liveness
+// probe.
+//
+// revision identifies the build so a deployed host can be matched to a commit.
+// It is injected at build time; when it was not, the platform's own build
+// metadata is consulted, and when neither exists it says "unknown". A health
+// endpoint that guessed a revision would be worse than one that admits it has
+// none, so there is no default commit.
+func (a *API) health(w http.ResponseWriter, r *http.Request) {
+	revision := strings.TrimSpace(a.revision)
+	if revision == "" {
+		// An empty field would make every consumer distinguish "no revision"
+		// from "unset", and would look identical to a build that injected the
+		// empty string. One honest token beats two ambiguous ones.
+		revision = "unknown"
+	}
+	writeJSON(w, 200, map[string]string{
+		"status":   "ok",
+		"service":  "everroot-api",
+		"revision": revision,
+	})
+}
+
 func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 	if a.db == nil {
 		writeError(w, 503, "database is not configured")

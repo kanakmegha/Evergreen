@@ -9,8 +9,13 @@ paths:
   /healthz:
     get:
       operationId: health
+      summary: Liveness. Reports the build revision; reads neither the database nor the AI provider.
       responses:
-        '200': { description: Process is alive }
+        '200':
+          description: The process is up and serving HTTP
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
   /readyz:
     get:
       operationId: ready
@@ -316,6 +321,21 @@ paths:
         '404': { description: Revision not found }
 components:
   schemas:
+    Health:
+      type: object
+      required: [status, service, revision]
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+          const: everroot-api
+        revision:
+          type: string
+          description: Git SHA the binary was built from, injected at build time; the literal "unknown" when it could not be determined
+      examples:
+        - { status: ok, service: everroot-api, revision: 1285d9c }
     Tradition:
       type: object
       required: [slug, name]

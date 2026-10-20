@@ -172,6 +172,41 @@ func warmDatabase(pool *pgxpool.Pool, logger *slog.Logger) {
 // recovered on a retry looked like a service that could not be reached.
 func writeTimeout() time.Duration { return ai.WorstCaseResponseTime + 20*time.Second }
 
+// revision identifies the commit this binary was built from. The deployment
+// build injects it:
+//
+//	go build -ldflags "-X main.revision=<sha>" -o server ./cmd/api
+//
+// The symbol is main.revision, not everroot/cmd/api.revision, even though the
+// package path is everroot/cmd/api. That is worth writing down because the
+// wrong form fails silently: the flag parses, the build succeeds, the binary
+// runs, and the variable simply keeps its default — so every probe would read
+// "unknown" on a deployment that looked correctly configured. Both forms were
+// built and run against the endpoint to confirm which one lands; only the
+// short form does.
+//
+// The default is empty so that resolvedRevision can tell "never injected" from
+// "injected as something real" and fall through to the platform's own metadata.
+var revision = "" //nolint:gochecknoglobals // build-time constant, set by -X
+
+// resolvedRevision reports which commit this process serves. Order matters: a
+// value baked into the binary is the truth about the binary, while the
+// environment describes the machine it happens to be running on, so the latter
+// is only consulted when the former is missing. When neither is available the
+// answer is "unknown" — never a guess, because /healthz is what a deployment
+// probe and a human both use to match a running host to a commit.
+func resolvedRevision() string {
+	if v := strings.TrimSpace(revision); v != "" {
+		return v
+	}
+	for _, key := range []string{"EVERROOT_REVISION", "VERCEL_GIT_COMMIT_SHA"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return "unknown"
+}
+
 func main() {
 	loadDotEnv(".env")
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -193,7 +228,8 @@ func main() {
 		go warmDatabase(pool, logger)
 	}
 
-	handler, err := httpapi.New(pool, logger)
+	built := resolvedRevision()
+	handler, err := httpapi.New(pool, logger, built)
 	if err != nil {
 		logger.Error("api initialization failed", "error", err)
 		_ = ln.Close()
@@ -207,7 +243,7 @@ func main() {
 		WriteTimeout:      writeTimeout(),
 		IdleTimeout:       60 * time.Second,
 	}
-	logger.Info("Everroot API listening", "addr", ln.Addr().String())
+	logger.Info("Everroot API listening", "addr", ln.Addr().String(), "revision", built)
 	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)

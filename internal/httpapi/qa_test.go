@@ -255,7 +255,7 @@ func TestUnconfiguredAIReportsNotConfigured(t *testing.T) {
 	t.Setenv("HF_TOKEN", "")
 	t.Setenv("HF_MODEL_ID", "")
 
-	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

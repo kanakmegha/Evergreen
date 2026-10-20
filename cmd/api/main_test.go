@@ -122,3 +122,43 @@ func TestConnectTimeoutDefaultAndOverride(t *testing.T) {
 		t.Fatalf("an invalid override must fall back to the default, got %s", got)
 	}
 }
+
+// The revision reported by /healthz must describe the binary, not the machine
+// it happens to be running on. A value baked in by the build wins; the
+// platform's own metadata is consulted only when the binary carries none; and
+// with neither available the answer is "unknown".
+//
+// That last case is the one worth testing. This endpoint exists so a deployed
+// host can be matched to a commit without trusting a dashboard, so a build that
+// was made without the linker flag has to admit it — a guessed revision would
+// be worse than none, because it would look like an answer.
+func TestResolvedRevisionPrefersTheBinaryThenTheEnvironment(t *testing.T) {
+	t.Setenv("EVERROOT_REVISION", "")
+	t.Setenv("VERCEL_GIT_COMMIT_SHA", "")
+
+	withBuild := revision
+	t.Cleanup(func() { revision = withBuild })
+
+	t.Run("build-time value wins", func(t *testing.T) {
+		revision = "from-the-build"
+		t.Setenv("EVERROOT_REVISION", "from-the-environment")
+		if got := resolvedRevision(); got != "from-the-build" {
+			t.Fatalf("resolvedRevision() = %q, want the build-time value", got)
+		}
+	})
+
+	t.Run("environment is the fallback", func(t *testing.T) {
+		revision = ""
+		t.Setenv("VERCEL_GIT_COMMIT_SHA", "from-the-platform")
+		if got := resolvedRevision(); got != "from-the-platform" {
+			t.Fatalf("resolvedRevision() = %q, want the platform's build metadata", got)
+		}
+	})
+
+	t.Run("unknown rather than empty", func(t *testing.T) {
+		revision = "   "
+		if got := resolvedRevision(); got != "unknown" {
+			t.Fatalf("resolvedRevision() = %q, want unknown", got)
+		}
+	})
+}
