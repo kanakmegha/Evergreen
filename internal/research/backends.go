@@ -150,8 +150,9 @@ func sourceKey(s Source) string {
 // FromEnv builds the provider the deployment configured, or nil when none is
 // configured.
 //
-// It reads only RESEARCH_PROVIDER, RESEARCH_API_URL and RESEARCH_API_KEY. The
-// key is used and never returned, logged or included in any error.
+// It reads RESEARCH_PROVIDER (or SEARCH_PROVIDER), RESEARCH_API_URL (or SEARCH_API_URL),
+// and RESEARCH_API_KEY (or SEARCH_API_KEY). The key is used and never returned, logged or
+// included in any error.
 //
 // The recognised values are:
 //
@@ -162,20 +163,33 @@ func sourceKey(s Source) string {
 //	"open-web,search-api"  both, fanned out concurrently
 func FromEnv(logger Logger) (Provider, error) {
 	name := strings.TrimSpace(os.Getenv("RESEARCH_PROVIDER"))
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("SEARCH_PROVIDER"))
+	}
+	apiURL := strings.TrimSpace(os.Getenv("RESEARCH_API_URL"))
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv("SEARCH_API_URL"))
+	}
+	apiKey := strings.TrimSpace(os.Getenv("RESEARCH_API_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("SEARCH_API_KEY"))
+	}
+
 	switch strings.ToLower(name) {
-	case "":
-		return nil, nil
-	case "none":
+	case "none", "off", "disabled":
 		return None{}, nil
 	case "open-web":
 		return OpenWeb(logger), nil
 	case "search-api":
-		key := os.Getenv("RESEARCH_API_KEY")
-		endpoint := os.Getenv("RESEARCH_API_URL")
-		if strings.TrimSpace(endpoint) == "" {
+		if apiURL == "" {
 			return nil, errors.New("RESEARCH_PROVIDER=search-api requires RESEARCH_API_URL")
 		}
-		return NewSearchAPI(endpoint, key, logger), nil
+		return NewSearchAPI(apiURL, apiKey, logger), nil
+	case "":
+		if apiURL != "" {
+			return NewSearchAPI(apiURL, apiKey, logger), nil
+		}
+		return nil, nil
 	}
 	if strings.Contains(strings.ToLower(name), ",") {
 		var providers []Provider
@@ -198,17 +212,25 @@ func FromEnv(logger Logger) (Provider, error) {
 
 // FromEnvNamed resolves a single provider name, for the multi-backend case.
 func FromEnvNamed(name string, logger Logger) (Provider, error) {
+	apiURL := strings.TrimSpace(os.Getenv("RESEARCH_API_URL"))
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(os.Getenv("SEARCH_API_URL"))
+	}
+	apiKey := strings.TrimSpace(os.Getenv("RESEARCH_API_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("SEARCH_API_KEY"))
+	}
+
 	switch strings.ToLower(name) {
-	case "", "none":
+	case "", "none", "off", "disabled":
 		return nil, nil
 	case "open-web":
 		return OpenWeb(logger), nil
 	case "search-api":
-		endpoint := os.Getenv("RESEARCH_API_URL")
-		if strings.TrimSpace(endpoint) == "" {
+		if apiURL == "" {
 			return nil, errors.New("RESEARCH_PROVIDER includes search-api but RESEARCH_API_URL is unset")
 		}
-		return NewSearchAPI(endpoint, os.Getenv("RESEARCH_API_KEY"), logger), nil
+		return NewSearchAPI(apiURL, apiKey, logger), nil
 	}
 	return nil, fmt.Errorf("unrecognised research backend %q", name)
 }

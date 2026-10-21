@@ -610,12 +610,18 @@ export interface ResearchSource {
 /**
  * How the answer was produced.
  *
- * `researched` — sources were retrieved and the answer is grounded in them.
- * `partial`    — some sources were retrieved, but at least one backend failed.
- * `unavailable`— nothing was researched. The answer is provisional and the
- *                interface must say so rather than implying it is sourced.
+ * `researched`     — sources were retrieved and the answer is grounded in them.
+ * `partial`        — some sources were retrieved, but at least one backend failed.
+ * `unavailable`    — research service temporarily unavailable. The answer is provisional.
+ * `no_sources`     — research succeeded but no authoritative sources matched these specific terms.
+ * `not_configured` — research provider is not configured in this server environment.
  */
-export type ResearchStatus = 'researched' | 'partial' | 'unavailable';
+export type ResearchStatus =
+  | 'researched'
+  | 'partial'
+  | 'unavailable'
+  | 'no_sources'
+  | 'not_configured';
 
 export interface AIDiscoveryResponse {
   /** `no_candidates` is a genuine answer: the model found nothing it would
@@ -744,8 +750,15 @@ export function distinctSources(response: AIDiscoveryResponse): ResearchSource[]
  * same tree — a shortlist drawn from one endpoint and provenance drawn from
  * another would let a sourced claim sit underneath a card it never supported.
  */
-export function candidateToSuggestion(candidate: AICandidate): RecommendationSuggestion {
-  return {
+export function candidateToSuggestion(
+  candidate: AICandidate,
+  allSources: ResearchSource[] = []
+): RecommendationSuggestion {
+  const sources =
+    candidate.sourceIds?.length && allSources.length
+      ? allSources.filter((s) => candidate.sourceIds.includes(s.id))
+      : [];
+  const suggestion: RecommendationSuggestion = {
     name: candidate.name,
     scientificName: candidate.scientificName ?? '',
     whyItMatches: candidate.whyItMatches,
@@ -754,6 +767,12 @@ export function candidateToSuggestion(candidate: AICandidate): RecommendationSug
     growingRequirements: candidate.growingRequirements ?? [],
     limitations: candidate.limitations ?? [],
   };
+  if (sources.length) suggestion.sources = sources;
+  if (candidate.culturalSignificance) suggestion.culturalSignificance = candidate.culturalSignificance;
+  if (candidate.ecologicalFit) suggestion.ecologicalFit = candidate.ecologicalFit;
+  if (candidate.identity) suggestion.identity = candidate.identity;
+  if (candidate.confidence) suggestion.confidence = candidate.confidence;
+  return suggestion;
 }
 
 /** How the interface should describe one evidence level in plain words.
@@ -1043,6 +1062,11 @@ export interface RecommendationSuggestion {
    * server's own verdict, which travels beside it as evidence.
    */
   culturalNote?: string;
+  sources?: ResearchSource[];
+  culturalSignificance?: AIClaim;
+  ecologicalFit?: AIClaim;
+  identity?: CandidateIdentity;
+  confidence?: CandidateConfidence;
 }
 
 export interface RecommendationsResponse {
@@ -1113,29 +1137,57 @@ export function recommendationsRequest(answers: FlowAnswers): RecommendationsReq
   };
 }
 
-/**
- * Maps the visitor's answers onto the AI-first discovery request.
- *
- * The follow-up answer, the option they chose and any picks they made are all
- * the visitor's own words about what they want, so they travel together as the
- * description rather than as three separate fields the model would have to
- * guess how to weigh. The intention stays as the interface's key: the server
- * resolves it to its label, and an intention that is not one of the known keys
- * passes through as free text instead of being refused.
- */
 export function aiDiscoveryRequest(answers: FlowAnswers): AIDiscoveryRequest {
   const label =
     followUpOptionLabel(answers.intention, answers.followUpChoice) ?? answers.followUpChoice ?? '';
-  const parts = [
-    answers.followUpNote.trim(),
-    label.trim(),
-    ...answers.followUpPicks.map((pick) => pick.trim()),
-  ].filter(Boolean);
+  const parts: string[] = [];
+
+  if (answers.customIntention?.trim()) parts.push(answers.customIntention.trim());
+  if (answers.followUpNote?.trim()) parts.push(answers.followUpNote.trim());
+  if (label.trim()) parts.push(label.trim());
+  for (const pick of answers.followUpPicks ?? []) {
+    if (pick.trim()) parts.push(pick.trim());
+  }
+  if (answers.motivations?.length) {
+    parts.push(`Motivations: ${answers.motivations.join(', ')}`);
+  }
+  if (answers.clarification?.trim()) {
+    parts.push(`Cultural context: ${answers.clarification.trim()}`);
+  }
+
+  // Determine tradition dynamically from user input or chosen context
+  let tradition = answers.tradition ?? '';
+  if (answers.customCulture?.trim()) {
+    tradition = answers.customCulture.trim();
+  }
+
+  // Check astrology system
+  const text = `${answers.customIntention ?? ''} ${answers.followUpNote ?? ''} ${answers.customCulture ?? ''}`;
+  const astro = detectAstrologyContext(text, answers.followUpChoice);
+  const astroSystem =
+    answers.astrologySystem ?? (astro.system || (astro.isAstrology ? 'western' : undefined));
+
+  if (astroSystem === 'western') {
+    if (!tradition) tradition = 'Western zodiac (default)';
+    parts.push('Astrological tradition: Western zodiac (default)');
+  } else if (astroSystem === 'vedic') {
+    if (!tradition) tradition = 'Indian / Vedic astrology (Nakshatras)';
+    parts.push('Astrological tradition: Indian / Vedic astrology');
+  } else if (astroSystem === 'tamil') {
+    if (!tradition) tradition = 'Tamil astrological tradition';
+    parts.push('Astrological tradition: Tamil astrological tradition');
+  } else if (astroSystem === 'other' && answers.clarification) {
+    if (!tradition) tradition = answers.clarification;
+  }
+
+  const intention =
+    answers.intention ??
+    (answers.customIntention?.trim() ? answers.customIntention.trim() : 'explore');
 
   return {
-    intention: answers.intention ?? 'explore',
-    description: parts.join('. '),
-    tradition: answers.tradition ?? '',
+    intention,
+    description: parts.filter(Boolean).join('. '),
+    tradition,
     region: answers.region ?? '',
     nakshatra: answers.nakshatra ?? '',
     constraints: [],
@@ -1228,16 +1280,32 @@ export function explanationFailureText(
    Flow state
 --------------------------------------------------------------------------- */
 
-export type StepId = 'intention' | 'followup' | 'tradition' | 'culture' | 'nakshatra';
+export type StepId =
+  | 'intention'
+  | 'clarification'
+  | 'followup'
+  | 'tradition'
+  | 'culture'
+  | 'nakshatra';
 
 export interface FlowAnswers {
   intention: IntentionId | null;
+  /** Free-text description of why the user wants a tree */
+  customIntention?: string;
+  /** Multiple selected motivations, e.g. 'culture', 'astrology', 'ecology', 'memorial', etc. */
+  motivations: string[];
   followUpChoice: string | null;
   followUpNote: string;
   /** Short, predefined starting points the user opted into. */
   followUpPicks: string[];
   tradition: string | null;
   traditionName: string;
+  /** Specific culture or tradition free-text or choice */
+  customCulture?: string;
+  /** Astrological system when relevant */
+  astrologySystem?: 'western' | 'vedic' | 'tamil' | 'other' | 'explore' | 'none';
+  /** Clarification response if asked */
+  clarification?: string;
   /** Empty string means "any region". */
   region: string;
   /**
@@ -1259,11 +1327,16 @@ export interface FlowAnswers {
 export function emptyAnswers(): FlowAnswers {
   return {
     intention: null,
+    customIntention: '',
+    motivations: [],
     followUpChoice: null,
     followUpNote: '',
     followUpPicks: [],
     tradition: null,
     traditionName: '',
+    customCulture: '',
+    astrologySystem: undefined,
+    clarification: '',
     region: '',
     naming: '',
     nakshatra: null,
@@ -1271,14 +1344,133 @@ export function emptyAnswers(): FlowAnswers {
   };
 }
 
+export interface AstrologyContext {
+  isAstrology: boolean;
+  system?: 'western' | 'vedic' | 'tamil' | 'other';
+  explicitTerm?: string;
+  isAmbiguous: boolean;
+}
+
+export function detectAstrologyContext(text: string, choice?: string | null): AstrologyContext {
+  const combined = `${text} ${choice ?? ''}`.toLowerCase();
+
+  const tamilTerms = [
+    'punarpoosam',
+    'tamil',
+    'karthigai',
+    'avittam',
+    'chithirai',
+    'magam',
+    'visakam',
+    'ayilyam',
+    'thiruvathirai',
+    'moolam',
+    'uthiradam',
+    'hastham',
+    'pooradam',
+    'sadayam',
+  ];
+  for (const term of tamilTerms) {
+    if (combined.includes(term)) {
+      return { isAstrology: true, system: 'tamil', explicitTerm: term, isAmbiguous: false };
+    }
+  }
+
+  const vedicTerms = [
+    'nakshatra',
+    'vedic',
+    'jyotish',
+    'rashi',
+    'ashwini',
+    'bharani',
+    'krittika',
+    'mriga',
+    'ardra',
+    'pushya',
+    'ashlesha',
+    'magha',
+    'purvaphalguni',
+    'uttaraphalguni',
+    'hasta',
+    'chitra',
+    'swati',
+    'vishakha',
+    'anuradha',
+    'jyeshtha',
+    'mula',
+    'purvashadha',
+    'uttarashadha',
+    'shravana',
+    'dhanishta',
+    'shatabhisha',
+    'purvabhadrapada',
+    'uttarabhadrapada',
+    'revati',
+  ];
+  for (const term of vedicTerms) {
+    if (combined.includes(term)) {
+      return { isAstrology: true, system: 'vedic', explicitTerm: term, isAmbiguous: false };
+    }
+  }
+
+  const westernTerms = [
+    'western',
+    'tropical',
+    'aries',
+    'taurus',
+    'gemini',
+    'cancer',
+    'leo',
+    'virgo',
+    'libra',
+    'scorpio',
+    'sagittarius',
+    'capricorn',
+    'aquarius',
+    'pisces',
+  ];
+  for (const term of westernTerms) {
+    if (combined.includes(term)) {
+      return { isAstrology: true, system: 'western', explicitTerm: term, isAmbiguous: false };
+    }
+  }
+
+  const generalTerms = [
+    'astrology',
+    'astrological',
+    'zodiac',
+    'horoscope',
+    'star sign',
+    'sun sign',
+    'moon sign',
+    'birth sign',
+    'birth star',
+  ];
+  for (const term of generalTerms) {
+    if (combined.includes(term)) {
+      return { isAstrology: true, explicitTerm: term, isAmbiguous: true };
+    }
+  }
+
+  if (choice === 'nakshatra') {
+    return { isAstrology: true, system: 'vedic', explicitTerm: 'nakshatra', isAmbiguous: false };
+  }
+
+  return { isAstrology: false, isAmbiguous: false };
+}
+
+export function needsAstrologyClarification(answers: FlowAnswers): boolean {
+  if (answers.astrologySystem) return false;
+  const motivations = answers.motivations ?? [];
+  const text = `${answers.customIntention ?? ''} ${answers.followUpNote ?? ''} ${answers.customCulture ?? ''} ${answers.traditionName ?? ''}`;
+  const detected = detectAstrologyContext(text, answers.followUpChoice);
+  if (motivations.includes('astrology') && !detected.system) return true;
+  return detected.isAstrology && detected.isAmbiguous;
+}
+
 /**
  * Answers restored from storage, with the fields added since the record was
  * written filled in.
- *
- * A record saved before the naming system was asked for has no `naming` on it,
- * and a page that read it back as `undefined` would send that straight into a
- * template. Normalising here means a visitor's older result keeps working
- * rather than needing a field it was never given.
  */
 export function normaliseAnswers(raw: Partial<FlowAnswers> | null | undefined): FlowAnswers {
   const base = emptyAnswers();
@@ -1286,6 +1478,10 @@ export function normaliseAnswers(raw: Partial<FlowAnswers> | null | undefined): 
   return {
     ...base,
     ...raw,
+    motivations: Array.isArray(raw.motivations) ? raw.motivations : base.motivations,
+    customIntention: typeof raw.customIntention === 'string' ? raw.customIntention : '',
+    customCulture: typeof raw.customCulture === 'string' ? raw.customCulture : '',
+    clarification: typeof raw.clarification === 'string' ? raw.clarification : '',
     followUpPicks: Array.isArray(raw.followUpPicks) ? raw.followUpPicks : base.followUpPicks,
     naming: typeof raw.naming === 'string' ? raw.naming : '',
     nakshatraName:
@@ -1307,14 +1503,23 @@ export function usesNakshatra(answers: FlowAnswers): boolean {
 /** The ordered step list for the current answers. */
 export function pathFor(answers: FlowAnswers): StepId[] {
   const steps: StepId[] = ['intention'];
-  if (!answers.intention) return steps;
-  if (answers.intention !== 'explore') steps.push('followup');
-  if (answers.intention === 'explore') steps.push('tradition');
-  // Cultural context comes before the nakshatra list, never after it. Handing a
-  // visitor one tradition's names to pick from and only afterwards asking which
-  // tradition they meant makes the question unanswerable: every option on the
-  // page has already assumed the answer.
-  if (usesNakshatra(answers)) steps.push('culture', 'nakshatra');
+  const hasText = Boolean(answers.customIntention?.trim() || answers.followUpNote?.trim());
+  if (!answers.intention && !hasText) return steps;
+
+  if (needsAstrologyClarification(answers)) {
+    steps.push('clarification');
+    return steps;
+  }
+
+  if (answers.intention === 'explore' && !answers.tradition) {
+    steps.push('tradition');
+  } else if (answers.intention && answers.intention !== 'explore') {
+    steps.push('followup');
+  }
+
+  if (usesNakshatra(answers)) {
+    steps.push('nakshatra');
+  }
   return steps;
 }
 

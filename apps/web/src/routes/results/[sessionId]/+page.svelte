@@ -325,10 +325,9 @@
     if (hasResults) {
       return recommendations.slice(0, SHORTLIST_SIZE).map((rec, index) => reviewedOption(rec, index));
     }
-    // A suggestion was drawn from these answers; the reference simply is on
-    // file. So when there is no reviewed record, the visitor's own answers come
-    // first and the catalogue stands behind them.
     if (suggestionViews.length) return suggestionViews;
+    // When dynamic AI discovery ran, do not fall back to unpopulated catalogue
+    if (aiDiscovery) return [];
     return referenceTrees
       .slice(0, SHORTLIST_SIZE)
       .map((tree, index) => referenceOption(tree, index, 'shortlist', true, culturalAssociation));
@@ -339,12 +338,34 @@
   const shortlistEmpty = $derived(
     exploratory && !shortlist.length && !suggestionsLoading && !explorationLoading
   );
-  const shortlistEmptyReason = $derived(
-    [suggestionNotice, explorationNotice].filter(Boolean).join(' ') ||
+  const shortlistEmptyReason = $derived.by(() => {
+    if (aiDiscovery) {
+      if (aiDiscovery.status === 'no_candidates' || aiDiscovery.researchStatus === 'no_sources') {
+        return (
+          aiDiscovery.researchSummary ||
+          'The research request completed, but found no tree candidates with sufficient documented evidence for these specific terms. You can broaden or rephrase your intention below.'
+        );
+      }
+      if (aiDiscovery.researchStatus === 'not_configured') {
+        return (
+          aiDiscovery.researchSummary ||
+          'Research provider is not configured on this server. Set RESEARCH_PROVIDER=open-web to enable key-free web research.'
+        );
+      }
+      if (aiDiscovery.researchStatus === 'unavailable') {
+        return (
+          aiDiscovery.researchSummary ||
+          'Research is temporarily unavailable right now. This does not mean no suitable trees exist — please try again in a moment or revise your question.'
+        );
+      }
+    }
+    return (
+      [suggestionNotice, explorationNotice].filter(Boolean).join(' ') ||
       (suggestionsStatus === 'no_suggestions'
-        ? 'The suggestion model did not find a tree it would stand behind for these answers, and the botanical reference has no records yet.'
-        : 'The suggestion service returned nothing for these answers, and the botanical reference has no records yet.')
-  );
+        ? 'The suggestion model did not find a tree it would stand behind for these answers.'
+        : 'The suggestion service returned nothing for these answers.')
+    );
+  });
 
   const headline = $derived(
     hasResults
@@ -401,6 +422,13 @@
    */
   const evidencePill = $derived.by<{ text: string; tone: 'ok' | 'none' } | null>(() => {
     if (hasResults) return { text: 'Reviewed association on record', tone: 'ok' };
+    if (aiDiscovery) {
+      if (researchStatus === 'researched') return { text: 'Source-grounded discovery', tone: 'ok' };
+      if (researchStatus === 'partial') return { text: 'Partially researched discovery', tone: 'ok' };
+      if (researchStatus === 'no_sources') return { text: 'Provisional discovery (no sources found)', tone: 'none' };
+      if (researchStatus === 'not_configured') return { text: 'Provisional discovery (research unconfigured)', tone: 'none' };
+      if (researchStatus === 'unavailable') return { text: 'Provisional discovery (research unavailable)', tone: 'none' };
+    }
     if (!culturalAssociation) return null;
     if (culturalAssociation === 'reviewed_match') return { text: 'Reviewed record exists', tone: 'ok' };
     return { text: 'Botanical records only', tone: 'none' };
@@ -557,10 +585,10 @@
    * to display a panel of caveats beside an answer nobody looked anything up
    * for.
    */
-  async function loadSuggestions() {
+  async function loadSuggestions(force = false) {
     // One request per result, and never a second while one is in flight: these
     // are paid calls, so a re-entry must not silently buy another answer.
-    if (!record || suggestionsLoading || suggestions.length) return;
+    if (!record || suggestionsLoading || (suggestions.length && !force)) return;
     suggestionsLoading = true;
     suggestionNotice = '';
     suggestionsQuestion = '';
@@ -572,33 +600,32 @@
     let produced = false;
     try {
       const researched = await runAIDiscovery(aiDiscoveryRequest(answers), loadSessionToken() ?? undefined);
+      aiDiscovery = researched;
+      suggestionsStatus = researched.status;
+      suggestionsQuestion = researched.followUpQuestion ?? '';
       if (researched.candidates.length) {
-        aiDiscovery = researched;
-        suggestions = researched.candidates.map(candidateToSuggestion);
+        suggestions = researched.candidates.map((c) => candidateToSuggestion(c, researched.sources));
         // No gate verdict travels with a research pass. The publication gate
         // only ever reports on a REVIEWED association, and this answer has
         // none — leaving the evidence null means the cards claim no reviewed
         // match, which is exactly what is true of them.
         suggestionsEvidence = null;
-        suggestionsStatus = researched.status;
-        suggestionsQuestion = researched.followUpQuestion ?? '';
         produced = true;
       } else {
         // An honest empty answer from the model is still an answer, and it
         // must not be retried by the older endpoint as though it were a
         // failure. The provenance panel has something to say about it: no
         // candidates, and why.
-        aiDiscovery = researched;
         suggestions = [];
-        suggestionsStatus = researched.status;
-        suggestionsQuestion = researched.followUpQuestion ?? '';
         produced = true;
       }
-    } catch {
+    } catch (err) {
       // The research pass is optional. Falling through to the older endpoint
       // keeps the shortlist working while the new one is unconfigured, and the
       // panel stays hidden so nothing implies a research record exists.
       aiDiscovery = null;
+      suggestionNotice =
+        err instanceof Error ? err.message : 'Research service is temporarily unavailable.';
     }
 
     if (!produced) {
@@ -932,7 +959,7 @@
                     : 'The associations on record'
                   : 'Start with these'}
               </h2>
-              {#if !hasResults && !suggestionViews.length && shortlist.length < SHORTLIST_SIZE}
+              {#if !hasResults && !suggestionViews.length && shortlist.length < SHORTLIST_SIZE && !aiDiscovery}
                 <p class="shortlist__count">
                   {catalogue.length}
                   {catalogue.length === 1 ? 'tree is' : 'trees are'} in Everroot’s botanical
@@ -942,12 +969,38 @@
             </div>
 
             {#if shortlistEmpty}
-              <!-- Nothing to show, and both calls that could have filled it have
-                   settled. Saying so is the alternative to a silent page. -->
-              <p class="shortlist__count" role="status">
-                <strong>Nothing to show for these answers yet.</strong>
-                {shortlistEmptyReason}
-              </p>
+              <!-- Actionable discovery empty / outage state -->
+              <div class="card-surface panel" style="padding: 1.5rem; margin-top: 1rem; border-radius: 8px;" role="status">
+                <p style="font-size: 1.05rem; font-weight: 600; color: #1e332a; margin-bottom: 0.5rem;">
+                  {#if aiDiscovery?.researchStatus === 'unavailable' || suggestionNotice}
+                    Research temporarily unavailable
+                  {:else if aiDiscovery?.researchStatus === 'not_configured'}
+                    Research provider unconfigured
+                  {:else if aiDiscovery?.status === 'no_candidates' || aiDiscovery?.researchStatus === 'no_sources'}
+                    No candidates found with sufficient evidence
+                  {:else}
+                    Nothing to show for these answers yet
+                  {/if}
+                </p>
+                <p style="font-size: 0.92rem; color: #53645c; line-height: 1.5; margin-bottom: 1.25rem;">
+                  {shortlistEmptyReason}
+                </p>
+                <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+                  {#if aiDiscovery?.researchStatus === 'unavailable' || aiDiscovery?.researchStatus === 'not_configured' || suggestionNotice}
+                    <button
+                      class="btn btn--primary btn--sm"
+                      type="button"
+                      onclick={() => void loadSuggestions(true)}
+                      disabled={suggestionsLoading}
+                    >
+                      {suggestionsLoading ? 'Retrying…' : 'Retry discovery'}
+                    </button>
+                  {/if}
+                  <a class="btn btn--soft btn--sm" href="/discover">
+                    Revise your intention
+                  </a>
+                </div>
+              </div>
             {:else if shortlistNote && (shortlistNote.loading || shortlistNote.text || shortlistNote.notice)}
               <div class="note card-surface" aria-live="polite">
                 <p class="note__label">
@@ -1014,6 +1067,14 @@
               Nothing was researched for this answer, so it comes from general
               botanical knowledge rather than from sources. Treat the tree ideas
               as a starting point to check, not as documented findings.
+            </p>
+          {:else if researchStatus === 'not_configured'}
+            <p class="notice notice--info banner" role="status" style="margin-bottom: 0.75rem;">
+              Research provider is not configured on this server. To enable key-free web and biodiversity research, set <code>RESEARCH_PROVIDER=open-web</code> in your environment.
+            </p>
+          {:else if researchStatus === 'no_sources'}
+            <p class="notice notice--info banner" role="status" style="margin-bottom: 0.75rem;">
+              Research ran, but no reliable external sources were found for these specific criteria.
             </p>
           {:else if researchStatus === 'partial'}
             <p class="notice notice--info banner" role="status" style="margin-bottom: 0.75rem;">

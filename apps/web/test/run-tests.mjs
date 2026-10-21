@@ -59,6 +59,7 @@ const groups = [
       'discoveryAI.test.ts',
       'nakshatraStep.test.ts',
       'cultureFirst.test.ts',
+      'intentionCultureDiscovery.test.ts',
     ],
     define: {
       __TEST_PUBLIC_API_URL__: JSON.stringify(CONFIGURED_ORIGIN),

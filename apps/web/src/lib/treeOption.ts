@@ -324,11 +324,26 @@ export function suggestionOption(
     facts.push({ label: 'Watch out', value: limitation });
   }
 
-  // The model may explain a cultural request Everroot could not answer, and
-  // that is the only version of this note it is ever allowed to write: it
-  // restates a verdict the server computed, rather than forming one. When it
-  // wrote nothing — or was never asked — the server's own sentence stands.
   const modelNote = (suggestion.culturalNote ?? '').trim();
+  const tags: OptionTag[] = [];
+  if (suggestion.identity?.status === 'confirmed') {
+    tags.push({ text: 'Taxonomy verified (GBIF)', tone: 'neutral' });
+  }
+  if (suggestion.sources && suggestion.sources.length > 0) {
+    tags.push({ text: 'Backed by sources', tone: 'neutral' });
+  } else {
+    tags.push({ text: 'AI-generated suggestion', tone: 'pending' });
+  }
+
+  const culturalVerified = suggestion.culturalSignificance?.evidence === 'sourced';
+
+  const sources: OptionSource[] = (suggestion.sources ?? []).map((s) => ({
+    title: s.title,
+    url: s.url,
+    meta: s.publisher ? `${s.publisher} · ${s.kind.replace(/_/g, ' ')}` : s.kind.replace(/_/g, ' '),
+    tags: [s.kind.replace(/_/g, ' ')],
+    attribution: s.publisher ?? '',
+  }));
 
   return {
     key: `${scope}-suggestion-${index}`,
@@ -337,16 +352,15 @@ export function suggestionOption(
     mark: (suggestion.name || '?').charAt(0).toUpperCase(),
     scientificName,
     authorship: '',
-    tags: [{ text: 'AI-generated suggestion', tone: 'pending' }],
+    tags,
     whyIncluded: suggestion.whyItMatches,
-    culturalNote: modelNote || culturalNote(false, associationState),
-    culturalVerified: false,
+    culturalNote:
+      suggestion.culturalSignificance?.text || modelNote || culturalNote(false, associationState),
+    culturalVerified,
     facts,
     otherNames: [],
     gaps: SUGGESTION_GAPS,
-    // A generated idea has nothing to cite, and that is shown rather than
-    // patched over with an authority record belonging to a different tree.
-    sources: [],
+    sources,
     tree: null,
     referenceHref: '/trees',
     referenceLabel: 'Open the tree reference',

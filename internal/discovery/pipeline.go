@@ -53,9 +53,11 @@ type Verifier interface {
 // receives, so what the model was told and what the visitor is shown cannot
 // disagree.
 const (
-	StatusResearched  = ai.ResearchStatusResearched
-	StatusPartial     = ai.ResearchStatusPartial
-	StatusUnavailable = ai.ResearchStatusUnavailable
+	StatusResearched    = ai.ResearchStatusResearched
+	StatusPartial       = ai.ResearchStatusPartial
+	StatusUnavailable   = ai.ResearchStatusUnavailable
+	StatusNoSources     = ai.ResearchStatusNoSources
+	StatusNotConfigured = ai.ResearchStatusNotConfigured
 )
 
 // Request is one visitor's answers.
@@ -164,14 +166,15 @@ func (p *Pipeline) Run(ctx context.Context, req Request) Outcome {
 // what the status does.
 func (p *Pipeline) research(ctx context.Context, req Request) ([]research.Source, string) {
 	if p.Research == nil {
-		return nil, StatusUnavailable
+		return nil, StatusNotConfigured
+	}
+	if _, isNone := p.Research.(research.None); isNone {
+		return nil, StatusNotConfigured
 	}
 
 	terms := ai.DiscoverResearchTerms(req.toAIInput())
 	if len(terms) == 0 {
-		// Nothing to search for. That is not a failure; it is a request that
-		// gave the pipeline no words, which the follow-up question exists for.
-		return nil, StatusUnavailable
+		return nil, StatusNoSources
 	}
 
 	limit := p.SourceLimit
@@ -203,23 +206,23 @@ func (p *Pipeline) research(ctx context.Context, req Request) ([]research.Source
 	}
 
 	if err != nil {
-		// ErrNoSources means the backends answered and found nothing, which is
-		// a fact about the world rather than an outage. It is still not
-		// "researched", because there is nothing to have grounded the answer
-		// in, but it is not a failure to report either.
-		if !errors.Is(err, research.ErrNoSources) {
-			diag := research.Diagnose(err)
-			p.log().Warn("research failed; continuing with a provisional answer",
-				"category", string(diag.Category),
-				"retryable", diag.Retryable,
-				"detail", diag.Detail,
-			)
+		if errors.Is(err, research.ErrNoSources) {
+			return nil, StatusNoSources
 		}
+		if errors.Is(err, research.ErrNotConfigured) {
+			return nil, StatusNotConfigured
+		}
+		diag := research.Diagnose(err)
+		p.log().Warn("research failed; continuing with a provisional answer",
+			"category", string(diag.Category),
+			"retryable", diag.Retryable,
+			"detail", diag.Detail,
+		)
 		return nil, StatusUnavailable
 	}
 
 	if len(sources) == 0 {
-		return nil, StatusUnavailable
+		return nil, StatusNoSources
 	}
 	return sources, StatusResearched
 }

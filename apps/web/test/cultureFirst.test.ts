@@ -61,44 +61,30 @@ const VIA_CULTURE = {
   followUpChoice: 'nakshatra',
 };
 
-/* ------------------------------------------ cultural context comes first */
+/* ------------------------------------------ culture is separate from language */
 
-test('the cultural step is asked before the names it decides', () => {
+test('no language selector is confused with cultural selection in the discovery flow', () => {
   for (const [label, answers] of [
     ['exploring a tradition', VIA_EXPLORATION],
     ['asking for a nakshatra directly', VIA_CULTURE],
   ] as const) {
     const order = pathFor(answers);
-    const culture = order.indexOf('culture');
-    const nakshatra = order.indexOf('nakshatra');
-
-    assert.notEqual(culture, -1, `${label}: the cultural step is missing entirely`);
-    assert.notEqual(nakshatra, -1, `${label}: the nakshatra step is missing`);
     assert.ok(
-      culture < nakshatra,
-      `${label}: the naming system has to be chosen before the names — got ${JSON.stringify(order)}`
+      !order.includes('culture'),
+      `${label}: language/naming system selector must not be treated as a cultural gate step in primary flow`
     );
   }
 });
 
-test('asking for a nakshatra no longer settles the tradition behind the visitor', () => {
-  // It used to set `tradition` the moment the follow-up was answered, so the
-  // step that followed showed one tradition's names as if they were universal.
+test('asking for a nakshatra no longer forces a naming-language step', () => {
   const step = pathFor(VIA_CULTURE);
-  assert.ok(step.includes('culture'), 'a visitor is asked rather than told');
-
-  // Nothing anywhere infers a tradition from the visitor's other answers.
-  const answer = { ...VIA_CULTURE, tradition: null as string | null, traditionName: '' };
-  const order = pathFor(answer);
-  assert.ok(order.includes('culture') && order.includes('nakshatra'));
+  assert.ok(!step.includes('culture'), 'language selector removed from primary path');
+  assert.ok(step.includes('nakshatra'), 'reaches the nakshatra selection directly');
 });
 
-test('the cultural step is a step, so it can be reached, left, and passed', () => {
+test('cultural context, astrological system, and display language are separate concepts', () => {
   const order = pathFor(VIA_CULTURE) as StepId[];
-  assert.deepEqual(order, ['intention', 'followup', 'culture', 'nakshatra']);
-  // Back and forward both work because it is an ordinary member of the path,
-  // not a modal laid over the nakshatra list.
-  assert.ok(order.indexOf('culture') > 0, 'it can be gone back to');
+  assert.deepEqual(order, ['intention', 'followup', 'nakshatra']);
 });
 
 /* --------------------------------------- and it can be passed entirely */

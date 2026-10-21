@@ -39,11 +39,28 @@
 
   const STEP_LABELS: Record<StepId, string> = {
     intention: 'What matters',
+    clarification: 'Tradition context',
     followup: 'A little more',
     tradition: 'Tradition',
     culture: 'Cultural context',
     nakshatra: 'Nakshatra',
   };
+
+  interface MotivationExample {
+    id: string;
+    label: string;
+    icon: string;
+  }
+
+  const MOTIVATION_EXAMPLES: MotivationExample[] = [
+    { id: 'culture', label: 'Culture & Heritage', icon: 'globe' },
+    { id: 'spirituality', label: 'Spirituality & Faith', icon: 'book' },
+    { id: 'astrology', label: 'Astrology & Zodiac', icon: 'sun' },
+    { id: 'ecology', label: 'Ecology & Biodiversity', icon: 'leaf' },
+    { id: 'memorial', label: 'Memorials & Remembrance', icon: 'heart' },
+    { id: 'celebration', label: 'Celebrations & Milestones', icon: 'gift' },
+    { id: 'personal', label: 'Personal Meaning & Values', icon: 'sprout' },
+  ];
 
   let answers = $state<FlowAnswers>(emptyAnswers());
   let step = $state<StepId>('intention');
@@ -90,11 +107,13 @@
   const question = $derived(
     step === 'intention'
       ? 'What would you like your tree to represent?'
-      : step === 'followup'
-        ? follow?.question ?? 'Tell us a little more.'
-        : step === 'tradition'
-          ? 'Which tradition would you like to explore?'
-          : 'Which Nakshatra should we look under?'
+      : step === 'clarification'
+        ? 'Which astrological or cultural tradition would you like to explore?'
+        : step === 'followup'
+          ? follow?.question ?? 'Tell us a little more.'
+          : step === 'tradition'
+            ? 'Which tradition would you like to explore?'
+            : 'Which Nakshatra should we look under?'
   );
 
   /**
@@ -140,7 +159,14 @@
   );
 
   const canContinue = $derived.by(() => {
-    if (step === 'intention') return answers.intention !== null || answers.followUpNote.trim().length > 0;
+    if (step === 'intention') {
+      return (
+        answers.intention !== null ||
+        answers.followUpNote.trim().length > 0 ||
+        (answers.motivations && answers.motivations.length > 0)
+      );
+    }
+    if (step === 'clarification') return true;
     if (step === 'followup') return follow?.choices ? answers.followUpChoice !== null : true;
     if (step === 'tradition') return answers.tradition !== null || traditionSkippable;
     // Both cultural steps are optional. Neither asks for anything the
@@ -152,6 +178,11 @@
   const continueLabel = $derived.by(() => {
     if (step === 'intention' && !answers.intention && answers.followUpNote.trim().length > 0) {
       return 'Discover trees';
+    }
+    if (step === 'clarification') {
+      return answers.astrologySystem || answers.clarification?.trim()
+        ? 'Continue'
+        : 'Skip cultural context';
     }
     if (step === 'culture') {
       return answers.naming || answers.tradition ? 'Continue' : 'Skip cultural context';
@@ -248,6 +279,30 @@
     answers.followUpPicks = picks.includes(label)
       ? picks.filter((p) => p !== label)
       : [...picks, label];
+  }
+
+  function toggleMotivation(id: string) {
+    const current = answers.motivations ?? [];
+    answers.motivations = current.includes(id)
+      ? current.filter((m) => m !== id)
+      : [...current, id];
+  }
+
+  function chooseAstrology(value: string) {
+    answers.astrologySystem = value as FlowAnswers['astrologySystem'];
+    if (value === 'western') {
+      answers.tradition = 'Western zodiac (default)';
+      answers.traditionName = 'Western zodiac (default)';
+    } else if (value === 'vedic') {
+      answers.tradition = 'Indian / Vedic astrology';
+      answers.traditionName = 'Indian / Vedic astrology (Nakshatras)';
+    } else if (value === 'tamil') {
+      answers.tradition = 'Tamil astrological tradition';
+      answers.traditionName = 'Tamil astrological tradition';
+    } else if (value === 'explore' || value === 'none') {
+      answers.tradition = null;
+      answers.traditionName = '';
+    }
   }
 
   function enter(target: StepId) {
@@ -526,6 +581,25 @@
             </p>
           </div>
 
+          <p class="picks__label" style="margin-top: 1rem;">
+            Or explore by theme or motivation (examples to start from, not limits):
+          </p>
+          <div class="picks__row" role="group" aria-label="Motivations">
+            {#each MOTIVATION_EXAMPLES as mot (mot.id)}
+              <button
+                type="button"
+                class="pick"
+                aria-pressed={answers.motivations.includes(mot.id)}
+                onclick={() => toggleMotivation(mot.id)}
+              >
+                {#if answers.motivations.includes(mot.id)}
+                  <Icon name="check" size={14} strokeWidth={2.8} />
+                {/if}
+                {mot.label}
+              </button>
+            {/each}
+          </div>
+
           <p class="picks__label" style="margin-top: 1.5rem;">
             Or choose a discovery path (examples to start from):
           </p>
@@ -571,12 +645,93 @@
                       const val = (e.target as HTMLInputElement).value;
                       answers.tradition = val.trim() ? val : null;
                       answers.traditionName = val;
+                      answers.customCulture = val.trim();
                     }}
                     placeholder="e.g. Celtic folklore, Yoruba, Shinto, Vedic, local community tradition"
                   />
                 </div>
               </div>
             </details>
+          </div>
+        {:else if step === 'clarification'}
+          <p class="step__intro">
+            Astrology and cultural tree associations exist across many world traditions. Choose the
+            tradition that best matches your question, specify another, or continue with the Western
+            zodiac default. Everroot will dynamically research the relevant lore and botany.
+          </p>
+
+          <div class="choices" role="radiogroup" aria-labelledby="step-q">
+            <SelectableCard
+              name="astrology-system"
+              value="western"
+              selected={answers.astrologySystem ?? null}
+              label="Western zodiac (default)"
+              description="Tropical zodiac signs (Aries through Pisces) and classical botanical correspondences."
+              icon="sun"
+              onselect={(val) => chooseAstrology(val)}
+            />
+            <SelectableCard
+              name="astrology-system"
+              value="vedic"
+              selected={answers.astrologySystem ?? null}
+              label="Indian / Vedic astrology"
+              description="The 27 lunar Nakshatras and 12 Rāśis rooted in Vedic astronomy and cultural lore."
+              icon="sun"
+              onselect={(val) => chooseAstrology(val)}
+            />
+            <SelectableCard
+              name="astrology-system"
+              value="tamil"
+              selected={answers.astrologySystem ?? null}
+              label="Tamil astrological tradition"
+              description="Traditional tree, star, and temple grove associations documented in Tamil regional heritage."
+              icon="leaf"
+              onselect={(val) => chooseAstrology(val)}
+            />
+            <SelectableCard
+              name="astrology-system"
+              value="other"
+              selected={answers.astrologySystem ?? null}
+              label="Another cultural tradition"
+              description="Celtic tree astrology, Chinese lunar calendar, or any cultural tradition in your own words."
+              icon="globe"
+              onselect={(val) => chooseAstrology(val)}
+            />
+            <SelectableCard
+              name="astrology-system"
+              value="explore"
+              selected={answers.astrologySystem ?? null}
+              label="Help me explore"
+              description="Explore trees with an open, general approach without committing to one specific system."
+              icon="compass"
+              onselect={(val) => chooseAstrology(val)}
+            />
+          </div>
+
+          {#if answers.astrologySystem === 'other'}
+            <div class="field" style="margin-top: 1rem;">
+              <label for="custom-clarification">Specify your tradition or astrological system</label>
+              <input
+                id="custom-clarification"
+                type="text"
+                class="input"
+                bind:value={answers.clarification}
+                placeholder="e.g. Celtic tree astrology, Mayan calendar, or personal tradition"
+              />
+            </div>
+          {/if}
+
+          <div style="margin-top: 1rem;">
+            <button
+              class="btn btn--soft btn--sm"
+              type="button"
+              onclick={() => {
+                answers.astrologySystem = 'none';
+                next();
+              }}
+            >
+              Skip cultural context / Continue with general approach
+            </button>
           </div>
         {:else if step === 'followup'}
           {#if follow}

@@ -347,6 +347,65 @@ func TestDiscoverResearchSummaryIsHonestAboutResearch(t *testing.T) {
 	if s := DiscoverResearchSummary(ResearchStatusPartial, 2); !strings.Contains(s, "Partly") {
 		t.Errorf("summary = %q, must say the research was partial", s)
 	}
+	if s := DiscoverResearchSummary(ResearchStatusNoSources, 0); !strings.Contains(s, "no reliable sources") {
+		t.Errorf("summary = %q, must mention no reliable sources", s)
+	}
+	if s := DiscoverResearchSummary(ResearchStatusNotConfigured, 0); !strings.Contains(s, "not configured") {
+		t.Errorf("summary = %q, must say provider is not configured", s)
+	}
+}
+
+func TestPromptContainsAstrologyAndCulturalRules(t *testing.T) {
+	prompt := discoverSystemPrompt
+	requiredRules := []string{
+		"Western tropical zodiac as the default",
+		"Punarpoosam",
+		"Ashwini",
+		"Do NOT default it to Western zodiac",
+		"clarification in \"followUpQuestion\"",
+		"Unfamiliar traditions",
+	}
+	for _, rule := range requiredRules {
+		if !strings.Contains(prompt, rule) {
+			t.Errorf("system prompt missing critical rule: %q", rule)
+		}
+	}
+}
+
+func TestDiscoverResearchTermsHandlesAstrologyAndCultures(t *testing.T) {
+	// 1. Explicit Tamil / Punarpoosam request
+	terms := DiscoverResearchTerms(DiscoverInput{
+		Intention:   "culture",
+		Nakshatra:   "Punarpoosam",
+		Tradition:   "Tamil",
+		Description: "Looking for traditional tree associated with my birth star",
+	})
+	joined := strings.Join(terms, "|")
+	if !strings.Contains(joined, "Punarpoosam") || !strings.Contains(joined, "Tamil") {
+		t.Errorf("expected Punarpoosam and Tamil in terms, got: %v", terms)
+	}
+
+	// 2. Explicit Western zodiac request
+	zodiacTerms := DiscoverResearchTerms(DiscoverInput{
+		Intention:   "astrology",
+		Description: "Leo zodiac tree for July birthday",
+	})
+	joinedZodiac := strings.Join(zodiacTerms, "|")
+	if !strings.Contains(joinedZodiac, "Leo") {
+		t.Errorf("expected Leo in terms, got: %v", zodiacTerms)
+	}
+
+	// 3. Unfamiliar culture request without hardcoding
+	unfamiliarTerms := DiscoverResearchTerms(DiscoverInput{
+		Intention:   "culture",
+		Tradition:   "Yoruba sacred groves",
+		Region:      "West Africa",
+		Description: "Osanyin herbal and sacred trees",
+	})
+	joinedUnfamiliar := strings.Join(unfamiliarTerms, "|")
+	if !strings.Contains(joinedUnfamiliar, "Yoruba") || !strings.Contains(joinedUnfamiliar, "West Africa") {
+		t.Errorf("expected Yoruba and West Africa in terms, got: %v", unfamiliarTerms)
+	}
 }
 
 func mustJSON(v any) string {

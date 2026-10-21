@@ -221,9 +221,11 @@ type DiscoverResult struct {
 
 // Research status values.
 const (
-	ResearchStatusUnavailable = "unavailable"
-	ResearchStatusPartial     = "partial"
-	ResearchStatusResearched  = "researched"
+	ResearchStatusUnavailable   = "unavailable"
+	ResearchStatusPartial       = "partial"
+	ResearchStatusResearched    = "researched"
+	ResearchStatusNoSources     = "no_sources"
+	ResearchStatusNotConfigured = "not_configured"
 )
 
 const (
@@ -259,7 +261,7 @@ You receive ONE JSON object:
 - "context": a tradition, region and/or Nakshatra they chose to give. Context only. May be absent.
 - "constraints": practical requirements they named — location or climate, planting space, how much care they can give. May be absent.
 - "research": the sources retrieved for this request, each with an "id", "title", "publisher" and "snippet". May be empty.
-- "researchStatus": exactly one of "researched", "partial", "unavailable".
+- "researchStatus": one of "researched", "partial", "no_sources", "not_configured", "unavailable".
 - "researchSummary": one line describing what was retrieved.
 - "count": how many candidates to return.
 
@@ -296,13 +298,20 @@ CONFIDENCE — use exactly one of "high", "moderate", "low", "insufficient". Pic
 - "insufficient": the sources do not support a recommendation. In that case return NO candidates and put the problem in "followUpQuestion" instead.
 The level is your honest read of the evidence, not a number you are optimising. Do not award "high" to be helpful.
 
-CULTURE AND SOURCES:
+CULTURE, ASTROLOGY, AND TRADITIONS:
 - You MAY state a cultural association when a retrieved source supports it: name the source in "sourceIds" and set "evidence" to "sourced" when the source plainly says it, or "interpretation" when you are reading between the lines.
 - You may NOT claim a tradition is universal, ancient, religiously prescribed or universally accepted unless the source says exactly that about that exact practice.
 - Where sources describe regional variation, say so. One tradition is never a single universal practice, and describing one regional form as the whole practice is a factual error.
-- When the visitor named a tradition but not its regional form, or named a region spanning several climates, ask which in "followUpQuestion" rather than assuming one.
+- ASTROLOGY & CELESTIAL TRADITIONS:
+  * When a visitor explicitly mentions Nakshatra, Punarpoosam, Ashwini, Rāśi, Vedic astrology, or a Tamil custom, immediately recognize that specific cultural tradition. Do NOT default it to Western zodiac.
+  * When a visitor asks for a zodiac sign or star sign interpretation without specifying an astrological tradition (e.g. "I am a Leo, what is my tree?"), use the Western tropical zodiac as the default, and clearly label this choice in "whyItMatches" and cultural notes (e.g., "Interpreted under the Western tropical zodiac by default").
+  * When an astrology request is open and completely ambiguous with no sign or system specified (e.g. "which tree matches my star sign?"), ask ONE short clarification in "followUpQuestion" offering Western zodiac, Indian/Vedic astrology, Tamil astrological tradition, or another tradition in free text.
+  * When a visitor asks about a tradition-specific topic but the intended tradition is ambiguous, ask ONE focused clarification in "followUpQuestion".
+  * If a visitor does not want to specify a tradition or chooses to skip, proceed with an open, general/default approach.
 - Never infer anything about the visitor's ethnicity, religion, beliefs or identity from their name, location or wording. What they told you is what you know, and nothing more.
+- Unfamiliar traditions: research them dynamically from the retrieved sources. Never reject or gatekeep an unfamiliar culture or tradition.
 - A meaning the visitor supplied is theirs. Mark it "user_defined" and never upgrade it to a sourced fact.
+- PROVISIONAL REPLIES: When "researchStatus" is "not_configured", "no_sources", or "unavailable", state clearly in "whyItMatches" and claims that the candidates are based on general knowledge and have not been verified against live sources.
 
 WRITING RULES:
 - "whyItMatches" must be about THIS visitor. Name what they told you or chose and connect it to something specific about the tree — its mature size against their space, its climate against their region, its character against their purpose. A sentence that would read the same for every visitor is not a reason; rewrite it until it could only have been written for them. When they told you nothing personal, anchor it to the reason they came for and to the practical facts they did give.
@@ -668,29 +677,55 @@ func normaliseConfidence(value string) string {
 	return ConfidenceLow
 }
 
-// DiscoverResearchTerms derives the search terms for one request.
+// DiscoverResearchTerms derives clean, focused search terms for one request.
 //
 // It is deterministic on purpose. Deriving terms costs nothing, cannot fail and
 // cannot spend a model call, and the terms the visitor supplied themselves — a
 // tradition, a region, a Nakshatra, their own description — are a better
-// starting point than anything a model would guess at. A model-supplied plan
-// would be worth a second call only if this were measurably worse, and it is
-// not: these are the exact words the question was asked in.
+// starting point than anything a model would guess at.
 func DiscoverResearchTerms(in DiscoverInput) []string {
-	terms := make([]string, 0, 6)
+	terms := make([]string, 0, 8)
 	add := func(v string) {
 		if t := strings.TrimSpace(v); t != "" {
 			terms = append(terms, t)
 		}
 	}
-	add(in.Nakshatra)
-	add(in.Tradition)
-	add(in.Region)
-	add(in.Description)
-	add(in.Intention)
-	for _, c := range in.Constraints {
-		add(c)
+
+	if in.Nakshatra != "" {
+		add(in.Nakshatra)
+		add(in.Nakshatra + " tree")
 	}
+	if in.Tradition != "" {
+		add(in.Tradition)
+		if in.Nakshatra == "" {
+			add(in.Tradition + " sacred tree")
+		}
+	}
+	if in.Region != "" {
+		add(in.Region + " native tree")
+	}
+
+	// Concise description extraction so conversational paragraphs don't overwhelm search queries
+	if in.Description != "" {
+		desc := strings.TrimSpace(in.Description)
+		words := strings.Fields(desc)
+		if len(words) <= 6 {
+			add(desc)
+		} else {
+			add(strings.Join(words[:6], " "))
+		}
+	}
+
+	if in.Intention != "" && in.Intention != "explore" && in.Intention != "personal" {
+		add(in.Intention + " tree")
+	}
+
+	for _, c := range in.Constraints {
+		if ct := strings.TrimSpace(c); ct != "" {
+			add(ct)
+		}
+	}
+
 	if len(terms) == 0 {
 		return nil
 	}
@@ -706,6 +741,12 @@ func DiscoverResearchSummary(status string, sources int) string {
 		return fmt.Sprintf("Researched against %d source(s) retrieved for this request.", sources)
 	case ResearchStatusPartial:
 		return fmt.Sprintf("Partly researched: %d source(s) retrieved, and at least one backend was unavailable.", sources)
+	case ResearchStatusNoSources:
+		return "Not researched: no reliable sources were found for these specific terms."
+	case ResearchStatusNotConfigured:
+		return "Not researched: research provider is not configured on this server. Set RESEARCH_PROVIDER=open-web to enable key-free web research."
+	case ResearchStatusUnavailable:
+		return "Not researched: research temporarily unavailable (the research backend could not be reached)."
 	}
 	return "Not researched: no research backend was available for this request."
 }
