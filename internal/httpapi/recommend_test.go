@@ -144,6 +144,43 @@ func TestRecommendationsServeAnyIntentionWithoutADatabaseOrCatalogue(t *testing.
 	}
 }
 
+// A cultural question still reaches the model when the catalogue holds no rows
+// at all. The reviewed records answer one narrow question — has a reviewer
+// confirmed this association — and their absence must never be read as "there
+// is nothing to say about culture". The visitor's tradition, region and
+// nakshatra travel to the prompt, and the gate's verdict travels back as an
+// annotation.
+func TestCulturalDiscoveryReachesTheModelWithoutCatalogueRows(t *testing.T) {
+	stub := &stubRecommender{result: stubSuggestions("Neem", "Peepal")}
+	// postRecommendations builds an API with no database, so there are no
+	// catalogue rows behind this request by construction.
+	w, body := postRecommendations(t, stub,
+		`{"intention":"culture","tradition":"nakshatra-tree-association","region":"Tamil Nadu","nakshatra":"Rohini","answer":"What is said about the trees of Rohini?"}`,
+		io.Discard)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if stub.calls != 1 {
+		t.Fatalf("the model was called %d times, want 1", stub.calls)
+	}
+	if stub.got.Tradition != "nakshatra-tree-association" ||
+		stub.got.Region != "Tamil Nadu" ||
+		stub.got.Nakshatra != "Rohini" {
+		t.Errorf("the visitor's selection did not reach the model: %+v", stub.got)
+	}
+	if stub.got.IntentionID != "culture" {
+		t.Errorf("intention = %q, want %q", stub.got.IntentionID, "culture")
+	}
+	if got := suggestionsOf(t, body); len(got) != 2 {
+		t.Errorf("suggestions = %v, want the model's answer", got)
+	}
+	// Nothing was reviewed, so nothing may claim to have been.
+	if got := evidenceOf(t, body)["culturalAssociation"]; got != "no_reviewed_match" {
+		t.Errorf("culturalAssociation = %v, want no_reviewed_match", got)
+	}
+}
+
 // TestUnregisteredTraditionIsNeverRejected is the behaviour change the brief
 // asks for, stated at the boundary. This endpoint used to answer 400 whenever
 // the tradition named was not one Everroot carries, which turned "nobody has
@@ -230,18 +267,50 @@ func TestRecommendationsForCulturalSelectionWithoutVerifiedMapping(t *testing.T)
 	}
 }
 
-func TestRecommendationsRejectUnsupportedIntention(t *testing.T) {
+// TestRecommendationsAcceptsAFreeTextIntention pins the contract change that
+// opened discovery up. An intention that is not one of the interface's own
+// keys used to be refused with a 400, which meant a question about a tradition
+// Everroot had never heard of was turned away before a model ever saw it. The
+// paths are examples, not the limits of what Everroot will try to answer.
+//
+// Only an absent intention is still refused, because a discovery with nothing
+// to be about cannot be attempted at all.
+func TestRecommendationsAcceptsAFreeTextIntention(t *testing.T) {
+	stub := &stubRecommender{result: stubSuggestions("Neem")}
+	w, decoded := postRecommendations(t, stub,
+		`{"intention":"a tree that means something to the Ahom people","answer":"for my mother"}`, io.Discard)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %v; an unfamiliar intention must reach the model", w.Code, decoded)
+	}
+	if stub.got.IntentionLabel != "a tree that means something to the Ahom people" {
+		t.Errorf("the model was told %q, want the visitor's own words", stub.got.IntentionLabel)
+	}
+}
+
+func TestRecommendationsRequireAnIntention(t *testing.T) {
 	for _, body := range []string{
-		`{"intention":"make-money","answer":"a tree"}`,
 		`{"intention":"","answer":"a tree"}`,
+		`{"answer":"a tree"}`,
+		`{"intention":"   ","answer":"a tree"}`,
 	} {
 		w, decoded := postRecommendations(t, &stubRecommender{result: stubSuggestions("Neem")}, body, io.Discard)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", body, w.Code)
 		}
-		if decoded["error"] != "unsupported intention" {
+		if decoded["error"] != "an intention is required" {
 			t.Errorf("%s: error = %v", body, decoded["error"])
 		}
+	}
+}
+
+// A known key keeps mapping onto its existing label, so nothing the interface
+// already sends has changed meaning.
+func TestRecommendationsStillMapAKnownIntentionKey(t *testing.T) {
+	stub := &stubRecommender{result: stubSuggestions("Neem")}
+	_, _ = postRecommendations(t, stub, `{"intention":"remember","answer":"a tree"}`, io.Discard)
+	if stub.got.IntentionLabel != "someone they want to remember" {
+		t.Errorf("label = %q, want the remember key's label", stub.got.IntentionLabel)
 	}
 }
 

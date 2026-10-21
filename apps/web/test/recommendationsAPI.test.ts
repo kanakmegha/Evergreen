@@ -126,7 +126,7 @@ test('the optional things reach the page, and an absent one is absent', async ()
       },
     ],
     evidence: EVIDENCE,
-    promptVersion: 'v1.3-visitor-anchored-reasons',
+    promptVersion: 'v1.4-visitor-anchored-reasons',
     model: 'stub-model',
     disclaimer: 'Machine-written.',
     followUpQuestion: 'How much direct sun does the spot get?',

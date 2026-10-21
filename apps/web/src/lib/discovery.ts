@@ -210,6 +210,37 @@ export interface Nakshatra {
   ordinal: number;
 }
 
+/**
+ * One nakshatra as a chosen naming system names it.
+ *
+ * `canonical` is always the romanised form the API and the reviewed records are
+ * addressed with, so the spelling a visitor picks in their own language is what
+ * they are shown while a stable name is what travels on. It is optional because
+ * the unqualified list has no second spelling to report alongside its own.
+ */
+export interface NamedNakshatra extends Nakshatra {
+  canonical?: string;
+}
+
+/**
+ * A language and writing system Everroot can serve nakshatra names in.
+ *
+ * A visitor usually knows the twenty-seven by the names their own tradition
+ * uses. Offering only romanised Sanskrit would quietly make one tradition's
+ * spelling the default for everyone, so the choice is asked for first and the
+ * list is served in it.
+ */
+export interface NamingSystem {
+  /** Stable code sent back to the API. */
+  code: string;
+  /** How the system is described in English. */
+  name: string;
+  /** How speakers name it themselves, so the choice is recognisable at a glance. */
+  endonym: string;
+  /** The writing system the served names use. */
+  script: string;
+}
+
 export const NAKSHATRA_TRADITION = 'nakshatra-tree-association';
 
 /**
@@ -382,6 +413,25 @@ export function fetchNakshatras(base: string = apiBase()): Promise<Nakshatra[]> 
   return getJSON<Nakshatra[]>('/api/v1/nakshatras', base);
 }
 
+export function fetchNamingSystems(base: string = apiBase()): Promise<NamingSystem[]> {
+  return getJSON<NamingSystem[]>('/api/v1/naming-systems', base);
+}
+
+/**
+ * The twenty-seven as a chosen naming system names them.
+ *
+ * An unrecognised code still returns all twenty-seven — the sequence is the
+ * same everywhere and only the spelling differs — so a caller that wants to
+ * know whether it got what it asked for compares the code against
+ * fetchNamingSystems rather than treating an unknown code as a failure.
+ */
+export function fetchNakshatrasIn(code: string, base: string = apiBase()): Promise<NamedNakshatra[]> {
+  return getJSON<NamedNakshatra[]>(
+    `/api/v1/nakshatras/${encodeURIComponent(code)}`,
+    base
+  );
+}
+
 export function fetchRegions(traditionSlug: string, base: string = apiBase()): Promise<string[]> {
   return getJSON<string[]>(
     `/api/v1/traditions/${encodeURIComponent(traditionSlug)}/regions`,
@@ -488,6 +538,341 @@ export async function runDiscovery(input: DiscoveryRequestInput): Promise<Discov
     status: data.status ?? 'no_verified_mapping',
     recommendations: Array.isArray(data.recommendations) ? data.recommendations : [],
   };
+}
+
+/* ---------------------------------------------------------------------------
+   AI-first discovery (research, then recommend)
+
+   This is a different endpoint from runDiscovery above. runDiscovery asks the
+   publication gate whether a REVIEWED cultural association exists for a
+   selection; this one asks the model to research the question and recommend,
+   attributing every claim to the sources it retrieved. The two are deliberately
+   not aliases, and neither is a fallback for the other.
+--------------------------------------------------------------------------- */
+
+/** What a claim's support actually is. A closed vocabulary so the interface can
+ * render it consistently, and so a reply can never introduce a new one. */
+export type EvidenceLevel = 'sourced' | 'uncertain' | 'interpretation' | 'user_defined' | 'none';
+
+/** One statement about a candidate, with the evidence behind it. */
+export interface AIClaim {
+  text: string;
+  evidence: EvidenceLevel;
+  sourceIds: string[];
+}
+
+/** What a taxonomic record established about a candidate's scientific name.
+ * Written by the server, never by the model. */
+export interface CandidateIdentity {
+  status: 'confirmed' | 'not_found' | 'unverified' | 'not_attempted';
+  acceptedName?: string;
+  family?: string;
+  source?: string;
+}
+
+/** A candidate's overall assessment. The level is the model's honest read of
+ * the retrieved evidence — it is NOT an independently measured score, which is
+ * why the definition and the assessedBy attribution travel with it. */
+export interface CandidateConfidence {
+  level: 'high' | 'moderate' | 'low' | 'insufficient';
+  definition: string;
+  assessedBy: string;
+}
+
+/** One tree the model offered. */
+export interface AICandidate {
+  name: string;
+  scientificName: string;
+  whyItMatches: string;
+  botanicalDetail: string;
+  matureSize: string;
+  growingRequirements?: string[];
+  limitations?: string[];
+  culturalSignificance: AIClaim;
+  ecologicalFit: AIClaim;
+  identity: CandidateIdentity;
+  confidence: CandidateConfidence;
+  sourceIds: string[];
+}
+
+/** One retrieved finding. The URL is the real address the server resolved, not
+ * something the model wrote. */
+export interface ResearchSource {
+  id: string;
+  title: string;
+  url: string;
+  publisher?: string;
+  kind: 'web_page' | 'encyclopedia' | 'biodiversity_record' | 'scholarly';
+  snippet?: string;
+  retrievedAt: string;
+}
+
+/**
+ * How the answer was produced.
+ *
+ * `researched` — sources were retrieved and the answer is grounded in them.
+ * `partial`    — some sources were retrieved, but at least one backend failed.
+ * `unavailable`— nothing was researched. The answer is provisional and the
+ *                interface must say so rather than implying it is sourced.
+ */
+export type ResearchStatus = 'researched' | 'partial' | 'unavailable';
+
+export interface AIDiscoveryResponse {
+  /** `no_candidates` is a genuine answer: the model found nothing it would
+   * stand behind. It is never an error. */
+  status: 'ok' | 'no_candidates';
+  candidates: AICandidate[];
+  sources: ResearchSource[];
+  researchStatus: ResearchStatus;
+  researchSummary: string;
+  unverifiedAreas?: string[];
+  followUpQuestion?: string;
+  confidenceDefinitions: Record<string, string>;
+  promptVersion: string;
+  model: string;
+  disclaimer: string;
+  /** Present only when the answer was saved against the caller's session. */
+  runId?: string;
+  /** False means the answer was NOT kept. The interface must say so rather
+   * than leaving a visitor to assume their discovery was stored. */
+  saved: boolean;
+}
+
+export interface AIDiscoveryRequest {
+  /** Either one of the interface's intention keys, or the visitor's own words.
+   * An unfamiliar question is not refused; it reaches the model. */
+  intention: string;
+  description?: string;
+  tradition?: string;
+  region?: string;
+  nakshatra?: string;
+  constraints?: string[];
+  limit?: number;
+}
+
+/**
+ * Runs the AI-first discovery pipeline.
+ *
+ * A provider failure throws, and that is deliberate: an inference outage must
+ * reach the visitor as an error, never as a list with nothing in it, because
+ * the two look identical as an empty array and mean very different things.
+ *
+ * A RESEARCH failure does not throw. It arrives as researchStatus
+ * 'unavailable' with candidates still present, which is the pipeline's way of
+ * saying "this is provisional and nobody looked anything up".
+ */
+export async function runAIDiscovery(
+  input: AIDiscoveryRequest,
+  token?: string,
+  base: string = apiBase()
+): Promise<AIDiscoveryResponse> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'application/json',
+  };
+  if (token) headers['authorization'] = `Bearer ${token}`;
+
+  let res: Response;
+  try {
+    res = await fetch(apiURL('/api/v1/discovery', base), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(input),
+    });
+  } catch {
+    throw new Error('The discovery service could not be reached from this browser.');
+  }
+
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    // The server's message is written for a visitor and carries no internals,
+    // so it is preferred over a generic one; the status-derived message is the
+    // fallback when the body could not be read.
+    throw new Error(body.error || apiErrorMessage({ kind: classifyStatus(res.status) }, isAPIConfigured()));
+  }
+
+  const data = (await res.json()) as Partial<AIDiscoveryResponse>;
+  return {
+    status: data.status === 'no_candidates' ? 'no_candidates' : 'ok',
+    candidates: Array.isArray(data.candidates) ? data.candidates : [],
+    sources: Array.isArray(data.sources) ? data.sources : [],
+    researchStatus: data.researchStatus ?? 'unavailable',
+    researchSummary: data.researchSummary ?? '',
+    unverifiedAreas: Array.isArray(data.unverifiedAreas) ? data.unverifiedAreas : undefined,
+    followUpQuestion: data.followUpQuestion,
+    confidenceDefinitions: data.confidenceDefinitions ?? {},
+    promptVersion: data.promptVersion ?? '',
+    model: data.model ?? '',
+    disclaimer: data.disclaimer ?? '',
+    runId: data.runId,
+    saved: data.saved === true,
+  };
+}
+
+/** The visitor's own sources for a candidate, in citation order.
+ *
+ * A citation that does not resolve to a retrieved source is skipped rather
+ * than rendered as a broken entry. The server has already rejected an ID the
+ * model invented, so this is a second line of defence rather than the first. */
+export function sourcesFor(response: AIDiscoveryResponse, ids: string[]): ResearchSource[] {
+  const byId = new Map(response.sources.map((s) => [s.id, s]));
+  return ids.map((id) => byId.get(id)).filter((s): s is ResearchSource => Boolean(s));
+}
+
+/** Every source the answer drew on, in first-cited order. This is what the
+ * results page renders as its "sources consulted" list. */
+export function distinctSources(response: AIDiscoveryResponse): ResearchSource[] {
+  const seen = new Set<string>();
+  const out: ResearchSource[] = [];
+  for (const candidate of response.candidates) {
+    for (const source of sourcesFor(response, candidate.sourceIds ?? [])) {
+      if (seen.has(source.id)) continue;
+      seen.add(source.id);
+      out.push(source);
+    }
+  }
+  return out;
+}
+
+/**
+ * Reshapes one researched candidate into the card the shortlist already knows.
+ *
+ * It is a projection, not a translation of meaning: every field it sets is one
+ * the candidate actually carries, and anything the two shapes do not share is
+ * left unset rather than filled in. The point of the adapter is that the tree
+ * a visitor reads about and the tree the provenance panel describes are the
+ * same tree — a shortlist drawn from one endpoint and provenance drawn from
+ * another would let a sourced claim sit underneath a card it never supported.
+ */
+export function candidateToSuggestion(candidate: AICandidate): RecommendationSuggestion {
+  return {
+    name: candidate.name,
+    scientificName: candidate.scientificName ?? '',
+    whyItMatches: candidate.whyItMatches,
+    botanicalDetail: candidate.botanicalDetail ?? '',
+    matureSize: candidate.matureSize ?? '',
+    growingRequirements: candidate.growingRequirements ?? [],
+    limitations: candidate.limitations ?? [],
+  };
+}
+
+/** How the interface should describe one evidence level in plain words.
+ * Kept here rather than in the component so the wording cannot drift between
+ * the results page and any other surface that shows a claim. */
+export const EVIDENCE_LABELS: Record<EvidenceLevel, string> = {
+  sourced: 'Backed by a source',
+  uncertain: 'Only partly supported',
+  interpretation: 'An interpretation, not a documented fact',
+  user_defined: 'Your own meaning',
+  none: 'No evidence found',
+};
+
+/** Whether a claim should read as settled. Only `sourced` does; everything
+ * else is shown with its caveat, because presenting an interpretation as a
+ * fact is the exact failure this pipeline exists to prevent. */
+export function isClaimSourced(claim: AIClaim | undefined | null): boolean {
+  return claim?.evidence === 'sourced' && (claim.sourceIds?.length ?? 0) > 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Sessions and saved discoveries
+
+   A session is optional: a discovery never requires an account, and Everroot
+   never asks for an email, a name or a date of birth. The token is returned
+   once and is not recoverable afterwards — only its hash is stored server-side.
+--------------------------------------------------------------------------- */
+
+const SESSION_TOKEN_KEY = 'everroot.session.token';
+
+/** Reads the stored session token, if any. Never throws: a storage failure
+ * simply means the visitor is treated as having no session. */
+export function loadSessionToken(): string | null {
+  try {
+    return store('local')?.getItem(SESSION_TOKEN_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSessionToken(token: string): void {
+  try {
+    store('local')?.setItem(SESSION_TOKEN_KEY, token);
+  } catch {
+    /* a full or blocked storage must not break the flow */
+  }
+}
+
+export function clearSessionToken(): void {
+  try {
+    store('local')?.removeItem(SESSION_TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Obtains an anonymous session token, or returns null when none could be
+ * issued. It is never an error to be without one — a discovery works either
+ * way; it just cannot be saved. */
+export async function createSession(base: string = apiBase()): Promise<string | null> {
+  let res: Response;
+  try {
+    res = await fetch(apiURL('/api/v1/session', base), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: '{}',
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const data = (await res.json().catch(() => ({}))) as { token?: string };
+  return typeof data.token === 'string' && data.token ? data.token : null;
+}
+
+/** The caller's saved discoveries, newest first. Returns an empty list rather
+ * than throwing when there is no session or the store is unavailable, because
+ * a visitor with no saved discoveries and a visitor whose history cannot be
+ * read both have nothing to show. */
+export async function listSavedDiscoveries(base: string = apiBase()): Promise<SavedDiscoverySummary[]> {
+  const token = loadSessionToken();
+  if (!token) return [];
+  let res: Response;
+  try {
+    res = await fetch(apiURL('/api/v1/discovery', base), {
+      headers: { accept: 'application/json', authorization: `Bearer ${token}` },
+    });
+  } catch {
+    return [];
+  }
+  if (!res.ok) return [];
+  const data = (await res.json().catch(() => ({}))) as { discoveries?: SavedDiscoverySummary[] };
+  return Array.isArray(data.discoveries) ? data.discoveries : [];
+}
+
+export interface SavedDiscoverySummary {
+  id: string;
+  intention: string;
+  researchStatus: ResearchStatus;
+  status: 'running' | 'complete' | 'failed';
+  createdAt: string;
+  sourceCount: number;
+}
+
+/** Deletes one of the caller's own discoveries. Returns false when it could
+ * not be deleted, including when it was not theirs — the server deliberately
+ * reports those the same way, so an id cannot be probed. */
+export async function deleteSavedDiscovery(id: string, base: string = apiBase()): Promise<boolean> {
+  const token = loadSessionToken();
+  if (!token) return false;
+  try {
+    const res = await fetch(apiURL(`/api/v1/discovery/${encodeURIComponent(id)}`, base), {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return res.status === 204;
+  } catch {
+    return false;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -728,6 +1113,36 @@ export function recommendationsRequest(answers: FlowAnswers): RecommendationsReq
   };
 }
 
+/**
+ * Maps the visitor's answers onto the AI-first discovery request.
+ *
+ * The follow-up answer, the option they chose and any picks they made are all
+ * the visitor's own words about what they want, so they travel together as the
+ * description rather than as three separate fields the model would have to
+ * guess how to weigh. The intention stays as the interface's key: the server
+ * resolves it to its label, and an intention that is not one of the known keys
+ * passes through as free text instead of being refused.
+ */
+export function aiDiscoveryRequest(answers: FlowAnswers): AIDiscoveryRequest {
+  const label =
+    followUpOptionLabel(answers.intention, answers.followUpChoice) ?? answers.followUpChoice ?? '';
+  const parts = [
+    answers.followUpNote.trim(),
+    label.trim(),
+    ...answers.followUpPicks.map((pick) => pick.trim()),
+  ].filter(Boolean);
+
+  return {
+    intention: answers.intention ?? 'explore',
+    description: parts.join('. '),
+    tradition: answers.tradition ?? '',
+    region: answers.region ?? '',
+    nakshatra: answers.nakshatra ?? '',
+    constraints: [],
+    limit: 3,
+  };
+}
+
 export async function runRecommendations(
   input: RecommendationsRequest
 ): Promise<RecommendationsResponse> {
@@ -813,7 +1228,7 @@ export function explanationFailureText(
    Flow state
 --------------------------------------------------------------------------- */
 
-export type StepId = 'intention' | 'followup' | 'tradition' | 'nakshatra';
+export type StepId = 'intention' | 'followup' | 'tradition' | 'culture' | 'nakshatra';
 
 export interface FlowAnswers {
   intention: IntentionId | null;
@@ -825,7 +1240,20 @@ export interface FlowAnswers {
   traditionName: string;
   /** Empty string means "any region". */
   region: string;
+  /**
+   * The naming system the nakshatra names were shown in. Empty means the
+   * visitor expressed no preference, which is not the same as choosing the
+   * romanised one — nothing is inferred from their other answers.
+   */
+  naming: string;
+  /**
+   * The nakshatra as the API and the reviewed records know it, so a choice
+   * made in any naming system still reaches the same record.
+   */
   nakshatra: string | null;
+  /** The nakshatra as it was shown to the visitor, so the result page can
+   *  repeat it back in their own naming system rather than in a transliteration. */
+  nakshatraName: string;
 }
 
 export function emptyAnswers(): FlowAnswers {
@@ -837,7 +1265,35 @@ export function emptyAnswers(): FlowAnswers {
     tradition: null,
     traditionName: '',
     region: '',
+    naming: '',
     nakshatra: null,
+    nakshatraName: '',
+  };
+}
+
+/**
+ * Answers restored from storage, with the fields added since the record was
+ * written filled in.
+ *
+ * A record saved before the naming system was asked for has no `naming` on it,
+ * and a page that read it back as `undefined` would send that straight into a
+ * template. Normalising here means a visitor's older result keeps working
+ * rather than needing a field it was never given.
+ */
+export function normaliseAnswers(raw: Partial<FlowAnswers> | null | undefined): FlowAnswers {
+  const base = emptyAnswers();
+  if (!raw || typeof raw !== 'object') return base;
+  return {
+    ...base,
+    ...raw,
+    followUpPicks: Array.isArray(raw.followUpPicks) ? raw.followUpPicks : base.followUpPicks,
+    naming: typeof raw.naming === 'string' ? raw.naming : '',
+    nakshatraName:
+      typeof raw.nakshatraName === 'string'
+        ? raw.nakshatraName
+        : typeof raw.nakshatra === 'string'
+          ? raw.nakshatra
+          : '',
   };
 }
 
@@ -854,7 +1310,11 @@ export function pathFor(answers: FlowAnswers): StepId[] {
   if (!answers.intention) return steps;
   if (answers.intention !== 'explore') steps.push('followup');
   if (answers.intention === 'explore') steps.push('tradition');
-  if (usesNakshatra(answers)) steps.push('nakshatra');
+  // Cultural context comes before the nakshatra list, never after it. Handing a
+  // visitor one tradition's names to pick from and only afterwards asking which
+  // tradition they meant makes the question unanswerable: every option on the
+  // page has already assumed the answer.
+  if (usesNakshatra(answers)) steps.push('culture', 'nakshatra');
   return steps;
 }
 
@@ -937,7 +1397,7 @@ export interface FlowState {
 export function loadFlow(): FlowState | null {
   const raw = readJSON<FlowState>('session', FLOW_KEY);
   if (!raw || typeof raw !== 'object' || !raw.answers) return null;
-  return { answers: { ...emptyAnswers(), ...raw.answers }, step: raw.step ?? 'intention' };
+  return { answers: normaliseAnswers(raw.answers), step: raw.step ?? 'intention' };
 }
 
 export function saveFlow(state: FlowState): void {
@@ -991,7 +1451,12 @@ export function saveRecord(record: DiscoveryRecord): boolean {
 }
 
 export function loadRecord(id: string): DiscoveryRecord | null {
-  return readJSON<DiscoveryRecord>('local', RECORD_PREFIX + id);
+  const record = readJSON<DiscoveryRecord>('local', RECORD_PREFIX + id);
+  if (!record) return null;
+  // A record written before the naming system was asked for has no `naming` on
+  // it. Normalising keeps that result readable instead of handing a template
+  // a field that was never stored.
+  return { ...record, answers: normaliseAnswers(record.answers) };
 }
 
 /* --- saved trees (device-local only) --- */

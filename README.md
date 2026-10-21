@@ -40,6 +40,21 @@ set -a; . ./.env; set +a
 
 To confirm a fresh database, use a new local database/container volume, set `DATABASE_URL` to it, and run the same script. Migration `0002` contains only the 27-value Nakshatra input vocabulary; `0004` contains tradition and region selectors. Neither inserts cultural mappings or tree claims.
 
+### Database setup
+
+The configured Neon database has never been migrated: it currently has **zero tables and no `schema_migrations` row**. A successful `Ping` against it says nothing about the schema, which is why `go run ./cmd/dbcheck DIRECT_URL` reports `reachable=true schema_present=false` for it. With `DIRECT_URL` set to the unpooled endpoint, the safe command to apply the migrations is:
+
+```sh
+DIRECT_URL='postgres://…direct…' go run ./cmd/migrate
+```
+
+Run it only after confirming which database it will hit. By default the runner applies the **user-data** migrations only — `0011` (discovery sessions), `0013` (interactions and feedback) and `0014` (users, tokens, runs, messages, results, sources) — and skips `0001`–`0010` and `0012`, which build the reviewed catalogue and its publication gate. That is the AI-first default: discovery needs none of those tables, and a clean database migrates without them.
+
+Two consequences worth knowing before you run it:
+
+- Set `APPLY_LEGACY_CATALOGUE_MIGRATIONS=true` to apply all fourteen in order. Without it, `/api/v1/trees`, `/api/v1/discoveries` and `/api/v1/explain` answer `503` with *the reviewed catalogue is unavailable right now* — the routes exist and answer honestly, they just have no rows to read. The reference vocabulary (`/api/v1/traditions`, `/api/v1/nakshatras`, `/api/v1/naming-systems`) is served from the binary and is unaffected either way.
+- After migrating, `go run ./cmd/dbcheck DIRECT_URL` should report `reachable=true schema_present=true`. Schema presence is measured by `public.discovery_runs`, not by a catalogue table, and `cmd/migrate` verifies the six user-data tables while reporting the catalogue as informational rather than as a precondition.
+
 ## Query code generation
 
 SQL migrations are the schema source of truth. Generate the Go query package using the pinned generator:
@@ -164,6 +179,42 @@ The results page renders the follow-up question as a question, not as a placehol
 
 The results page asks for suggestions first and falls back to the explanation call only when none arrive, so a results view costs at most one model call either way.
 
+### AI-first discovery
+
+`POST /api/v1/discovery` is the AI-first discovery pipeline: it re-searches for every request and attributes every claim to what it retrieved. One request runs five stages (`internal/discovery/pipeline.go`):
+
+1. **Interpret** — the visitor's answers are reduced to what the question needs: an intention (a known key or their own words), their description, any tradition, region or Nakshatra they chose to give, and their practical constraints.
+2. **Research** — sources are retrieved dynamically from those words *before* the model call, so the model is grounded rather than recalling.
+3. **Generate** — one model call draws candidates from what was retrieved, citing only the source IDs it was shown; an ID the server never retrieved is rejected rather than passed on.
+4. **Verify** — each candidate's scientific name is checked against the GBIF backbone taxonomy. The verdict is written by the server, never by the model, and a lookup that failed is labelled `unverified` rather than `not_found`.
+5. **Validate** — what the server owns is repaired after the reply: confidence definitions and the `assessedBy` attribution are attached by the server, citations it cannot resolve are dropped, and a claim that says `sourced` with no surviving citation is downgraded to `uncertain`.
+
+Two rules hold across all five. **A model failure is an error** — **429** with `Retry-After`, **503** when the AI layer is not configured or unavailable, **502** when the reply could not be read — and never an empty candidate list. **A research failure is not an error**: the discovery still answers **200** with `researchStatus` set to `unavailable` (or `partial` when some backends answered) and a `researchSummary` saying what actually happened. Neither stage reads PostgreSQL, so a visitor gets an answer with the database empty or unreachable.
+
+Research runs through its own provider abstraction (`internal/research`) configured with the three variables documented in `.env.example`. The default that needs no API key is `open-web` — Wikipedia for narrative context, GBIF for botanical identity — fanned out concurrently; `search-api` adds or substitutes a general web search service over `RESEARCH_API_URL` and `RESEARCH_API_KEY`; and a comma-separated value such as `open-web,search-api` uses both. `RESEARCH_PROVIDER` unset, empty or `none` switches research off, and discoveries are labelled `unavailable` rather than pretending to be researched.
+
+The honest limits of the key-free backends are part of the contract, not a footnote:
+
+- **Wikipedia is an encyclopedia source, not peer-reviewed.** Every source carries its kind (`encyclopedia` alongside `web_page`, `biodiversity_record` and `scholarly`) so nothing Everroot renders implies more weight than an encyclopedia entry deserves.
+- **GBIF verifies botanical identity only** — whether a binomial is the accepted name and which family it sits in. It deliberately does **not** claim nativeness or planting suitability: GBIF occurrence data includes cultivated and introduced specimens, so an occurrence count is not evidence that a species belongs in a visitor's region, and Everroot never presents it as one.
+- **The configured inference provider cannot do live web search.** Its router rejects a `web_search` tool with HTTP 400 and offers no search-capable model among its 135 models — measured, not assumed — which is precisely why research is a separate provider abstraction rather than a tool attached to the model call.
+
+The endpoints this adds:
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /api/v1/discovery` | Run one pipeline. Body: `intention` (a known key — `personal`, `remember`, `culture`, `future`, `explore` — or 3-300 characters of free text), `description`, `tradition`, `region`, `nakshatra`, `constraints[]`, `limit` (1-5). Reply: `status` (`ok` or `no_candidates`), `candidates`, `sources`, `researchStatus`, `researchSummary`, `unverifiedAreas`, an optional `followUpQuestion`, `confidenceDefinitions`, `promptVersion`, `model`, `disclaimer`, `runId` and `saved`. |
+| `POST /api/v1/session` | Issue an optional anonymous session token (**201**). It is shown once and only its hash is stored; Everroot asks for no email, name or date of birth. |
+| `GET /api/v1/discovery` | List the caller's own saved discoveries, newest first. `Authorization: Bearer <token>` required; **401** without one. |
+| `GET /api/v1/discovery/{id}` | Read one saved discovery with its result and sources. Bearer required; **404** when it is not the caller's — deliberately identical to an id that does not exist. |
+| `DELETE /api/v1/discovery/{id}` | Delete one saved discovery. Bearer required; **204**, or the same **404**. |
+
+`POST /api/v1/recommendations` accepts an intention the same way now: a known key keeps its existing label, while free text reaches the model instead of being refused with a 400 "unsupported intention" as it previously was.
+
+Each candidate carries its evidence rather than an unlabelled assertion: `culturalSignificance` and `ecologicalFit` each state a text, an `evidence` value (`sourced`, `uncertain`, `interpretation`, `user_defined` or `none`) and the `sourceIds` behind them, and `confidence` (`high`, `moderate`, `low`, `insufficient`) travels with its published `definition` and an `assessedBy` that says a language model assessed it from the retrieved sources.
+
+The saved-discovery schema (migration `0014`) holds user data only: **no tree catalogue, no cultural mapping tables and no Nakshatra or zodiac association tables.** Research retrieved for one discovery is saved on that discovery's own rows and never into a shared global table — a permanent answer table would invite a later reader to treat a model output as a reviewed fact.
+
 ## Deploying
 
 The project deploys as two Vercel projects from this one repository:
@@ -179,7 +230,7 @@ The backend is a listening HTTP server, not a serverless function. It reads the 
 
 | Variable | Project | Required | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | Backend | Yes, for the reviewed catalogue | PostgreSQL connection (Neon: use the **pooled** endpoint with `sslmode=require`). The nakshatra, tradition, region and tree catalogue and interaction persistence all read it. **The AI answer path does not**: `/api/v1/questions` answers from the model alone. |
+| `DATABASE_URL` | Backend | Yes, for the tree catalogue and persistence | PostgreSQL connection (Neon: use the **pooled** endpoint with `sslmode=require`). The tree catalogue, the reviewed associations behind `/api/v1/discoveries` and `/api/v1/explain`, and interaction persistence all read it. The nakshatra, tradition and region lists do **not** — they are reference vocabulary served from the binary, so discovery works with the database absent. **The AI answer path does not** either: `/api/v1/questions` answers from the model alone. |
 | `DIRECT_URL` | — | No | The **direct** (unpooled) endpoint. Used only by `cmd/migrate`, never by the server, because the migration runner holds a session-level advisory lock. |
 | `DATABASE_CONNECT_TIMEOUT` | Backend | No | Bound on one connection attempt (default `10s`). Raise it if Neon cold starts exceed the default. |
 | `DATABASE_FORCE_IPV4` | Backend | No | Dial PostgreSQL over IPv4 only (default on). The endpoint is reachable over IPv4 but its IPv6 route does not answer, so a dual-stack dial spends the connect budget on addresses that never respond and times out. Set to `false` only on a network where IPv6 is the working path. The hostname is still used for TLS verification and SNI; only the dial is restricted. |
@@ -225,11 +276,13 @@ node -e '(async () => {
 })()' https://<web-project>.vercel.app
 ```
 
-Then in DevTools → Network, reload `/discover` and walk to the tradition step: the three catalogue requests must show the backend hostname. If they do, the routing is correct and the only remaining failure is the 503 below — the API is reached, but the reviewed records cannot be served. That is a database state, not a routing one.
+Then in DevTools → Network, reload `/discover` and walk to the tradition step: the three catalogue requests must show the backend hostname. If they do, the routing is correct. All three are served from local reference data and need no database, so they should answer **200 with PostgreSQL stopped** — if one of them returns 503 here, the request itself failed rather than the records being missing.
 
 ### If the reviewed catalogue returns 503
 
-`/api/v1/nakshatras`, `/api/v1/traditions`, `/api/v1/traditions/{tradition}/regions` and `/api/v1/trees` describe records a person checked, so when the database cannot be reached they report **503 `the reviewed catalogue is unavailable right now`**. They deliberately do not answer from a built-in list: a hardcoded reply is indistinguishable from a reviewed record and would imply Everroot had checked something it had not.
+`/api/v1/trees` reads the botanical records a person checked, so when the database cannot be reached it reports **503 `the reviewed catalogue is unavailable right now`**. It deliberately does not answer from a built-in list: a hardcoded reply would be indistinguishable from a reviewed record and would imply Everroot had checked something it had not.
+
+`/api/v1/nakshatras`, `/api/v1/traditions`, `/api/v1/traditions/{tradition}/regions`, `/api/v1/naming-systems` and `/api/v1/nakshatras/{naming}` are the opposite case. They offer a vocabulary to choose from and assert nothing about any tree, so they are served from the binary and answer **200 with no database, an empty database or an unreachable one** — the 27 nakshatras, the traditions and the regions are the same rows migrations 0002 and 0004 insert. `/api/v1/nakshatras/{naming}` serves those same 27 in a chosen naming system, each entry carrying its `canonical` romanised name, and an unrecognised naming code returns the canonical list rather than an error since the sequence is the same in every naming system and only the spelling differs. Tamil names are served from the local reference list in `internal/httpapi/reference.go`, paired to the canonical 27 by ordinal: migration 0001 creates the `nakshatra_names` table but nothing has ever seeded it, so the Tamil spellings are local vocabulary rather than database rows — of the same kind as the canonical list, and asserting no more than it does. `/api/v1/discoveries` likewise needs no database: with none it returns `no_verified_mapping` and an empty list instead of failing.
 
 A 503 is a database problem, not a code problem, but "the database" covers several failures that need different fixes. Each failure is logged with a `category` and, when PostgreSQL itself answered, a `sqlstate`. The driver's own error string is never logged: for a connection failure it embeds the host and user from `DATABASE_URL`.
 
@@ -317,7 +370,7 @@ If both are served from one domain, set `PUBLIC_API_SAME_ORIGIN=true` on the fro
 
 1. Apply migrations to the database (manual, once per schema change). Verify with `go run ./cmd/dbcheck DIRECT_URL` — it must report `reachable=true schema_present=true`.
 2. Deploy the backend, with `DATABASE_URL`, `HF_TOKEN` and (for split origins) `WEB_ORIGIN` set. Remove any `API_ADDR` left over from local development.
-3. Verify the backend directly: `GET /healthz` should be 200 JSON whose `revision` equals the commit that was deployed, `GET /readyz` should be 200, and `GET /api/v1/nakshatras` should be 200 with 27 entries (not 503, not 500). If a catalogue endpoint returns 503, the log line names the `category`; see *If the reviewed catalogue returns 503* above.
+3. Verify the backend directly: `GET /healthz` should be 200 JSON whose `revision` equals the commit that was deployed, `GET /readyz` should be 200, and `GET /api/v1/nakshatras` should be 200 with 27 entries — that one serves the reference vocabulary, so it needs no database and a 503 here means a routing or build problem rather than a database one. `GET /api/v1/trees` is the endpoint that does need PostgreSQL: if it returns 503 the log line names the `category`; see *If the reviewed catalogue returns 503* above.
 4. Set `PUBLIC_API_URL` on the frontend if the origins differ, or `PUBLIC_API_SAME_ORIGIN=true` for a production single-origin deployment.
 5. Deploy the frontend last, so the build picks up `PUBLIC_API_URL`.
 

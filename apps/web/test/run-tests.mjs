@@ -37,7 +37,14 @@ const shared = {
 const groups = [
   {
     name: 'production build without PUBLIC_API_URL',
-    entries: ['apiURL.test.ts', 'apiErrors.test.ts', 'treeOption.test.ts', 'recommendations.test.ts'],
+    entries: [
+      'apiURL.test.ts',
+      'apiErrors.test.ts',
+      'treeOption.test.ts',
+      'recommendations.test.ts',
+      'birdScene.test.ts',
+      'resultsCopy.test.ts',
+    ],
     define: {
       __TEST_PUBLIC_API_URL__: 'undefined',
       __TEST_PUBLIC_SAME_ORIGIN__: 'undefined',
@@ -46,7 +53,13 @@ const groups = [
   },
   {
     name: 'production build with PUBLIC_API_URL set',
-    entries: ['apiConfigured.test.ts', 'recommendationsAPI.test.ts'],
+    entries: [
+      'apiConfigured.test.ts',
+      'recommendationsAPI.test.ts',
+      'discoveryAI.test.ts',
+      'nakshatraStep.test.ts',
+      'cultureFirst.test.ts',
+    ],
     define: {
       __TEST_PUBLIC_API_URL__: JSON.stringify(CONFIGURED_ORIGIN),
       __TEST_PUBLIC_SAME_ORIGIN__: 'undefined',

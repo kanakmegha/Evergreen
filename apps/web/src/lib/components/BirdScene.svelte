@@ -40,7 +40,7 @@
     aria-label={phase === 'landed' && treeName
       ? `A garden scene, with a bird resting on ${treeName}.`
       : 'A garden scene, with a bird crossing it while Everroot looks for trees.'}
-    preserveAspectRatio="xMidYMax slice"
+    preserveAspectRatio="xMidYMax meet"
   >
     <defs>
       <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
@@ -48,13 +48,11 @@
         <stop offset="62%" stop-color="#eef2e6" />
         <stop offset="100%" stop-color="#e3ead9" />
       </linearGradient>
-      <linearGradient id="chosenGlow" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#d9a44b" stop-opacity="0.5" />
-        <stop offset="100%" stop-color="#d9a44b" stop-opacity="0" />
-      </linearGradient>
     </defs>
 
     <rect width="800" height="240" fill="url(#sky)" />
+    <!-- The one sun. Nothing else in the scene is allowed to be a sun: when
+         the bird lands the picture must still have exactly this many. -->
     <circle cx="686" cy="50" r="26" fill="#e8c98f" opacity="0.85" />
 
     <!-- Distant treeline, then the garden it sits in. -->
@@ -97,15 +95,21 @@
       <circle cx="686" cy="158" r="18" fill="#356349" />
     </g>
 
-    <!-- The chosen tree: drawn a little larger, and ringed once it is chosen. -->
+    <!-- The chosen tree: drawn a little larger, and ringed once it is chosen.
+         The marker is an outline rather than a filled glow on purpose. A warm
+         disc fading in behind the bird would be a second sun in a scene that
+         already has one, and a visitor would have to work out which of the two
+         the bird had flown in from. -->
     <g class="tree tree--chosen">
-      <ellipse class="chosen-halo" cx="500" cy="140" rx="64" ry="60" fill="url(#chosenGlow)" />
       <rect x="493" y="146" width="13" height="54" fill="#8c5a32" />
       <circle cx="500" cy="128" r="40" fill="#244f3d" />
       <circle cx="470" cy="146" r="28" fill="#2b5a45" />
       <circle cx="530" cy="146" r="28" fill="#1b3d2e" />
       <circle cx="486" cy="112" r="22" fill="#3a6b55" />
       <circle cx="516" cy="114" r="20" fill="#2f6049" />
+      <!-- Drawn last, so it rings the canopy rather than hiding behind it, and
+           sized to clear the canopy's widest foliage. -->
+      <circle class="chosen-ring" cx="500" cy="128" r="64" fill="none" stroke="#d9a44b" stroke-width="3" />
     </g>
 
     <!-- The bird. Its wings beat while it flies and fold when it settles. -->
@@ -136,14 +140,37 @@
     background: var(--surface-soft, #fdfcf7);
   }
 
+  /*
+    The scene is drawn at its own proportions and nothing is cropped out of it.
+    A fixed height with `slice` scaled the drawing to cover the box, which cut
+    a different slice away at every width: on a phone it trimmed the sides, and
+    on a desktop it trimmed so much from the top that the sun and the bird's
+    whole flight path sat above the visible edge. Matching the height to the
+    drawing's ratio instead means all 800 units are on screen at every width,
+    and the bird cannot leave the box simply by leaving the drawing.
+
+    Below about 500px the ratio would make the scene shorter than the caption
+    needs, so a floor holds it open. That band is the scene's own background
+    colour, which is also the palest colour in the sky, so it reads as sky.
+  */
   .scene svg {
     display: block;
     width: 100%;
-    height: clamp(150px, 26vw, 230px);
+    height: auto;
+    aspect-ratio: 800 / 240;
+    min-height: 150px;
   }
 
+  /*
+    Rotation is about the bird itself. Left at an SVG element's default origin
+    it would swing around the centre of the whole drawing instead, so every
+    turn in the keyframes would carry the bird up and out of frame rather than
+    tipping it in place.
+  */
   .bird {
-    transform: translate(-90px, 46px);
+    transform-box: fill-box;
+    transform-origin: 50% 50%;
+    transform: translate(44px, 66px);
   }
 
   .scene[data-phase='flying'] .bird {
@@ -175,14 +202,14 @@
     transform: scaleY(0.42) translateY(1px);
   }
 
-  /* The halo only exists once the tree is the answer, so the picture agrees
+  /* The ring only exists once the tree is the answer, so the picture agrees
      with the shortlist rather than decorating a tree nobody chose. */
-  .chosen-halo {
+  .chosen-ring {
     opacity: 0;
     transition: opacity 0.7s ease 0.7s;
   }
 
-  .scene--landed .chosen-halo {
+  .scene--landed .chosen-ring {
     opacity: 1;
   }
 
@@ -198,33 +225,42 @@
     line-height: 1.5;
   }
 
+  /*
+    The bird's own drawing runs from -28 to 25 units wide and -22 to 7 tall
+    around the point these numbers move, and a five-degree turn adds a little
+    more on every side. Kept between 34 and 756 across and 26 and 215 down,
+    the whole bird — tail, beak and both wings — is inside the 800 x 240
+    drawing at every frame, including the first and the last. The old path
+    began at -90 and finished at 890, so it started and ended with nothing on
+    screen at all, and the loop appeared to pause rather than cross.
+  */
   @keyframes fly-across {
     0% {
-      transform: translate(-90px, 46px) rotate(-5deg);
+      transform: translate(44px, 66px) rotate(-5deg);
     }
-    22% {
-      transform: translate(140px, 16px) rotate(3deg);
+    25% {
+      transform: translate(210px, 44px) rotate(3deg);
     }
-    46% {
-      transform: translate(330px, 52px) rotate(-4deg);
+    50% {
+      transform: translate(380px, 72px) rotate(-4deg);
     }
-    72% {
-      transform: translate(545px, 14px) rotate(4deg);
+    75% {
+      transform: translate(566px, 42px) rotate(4deg);
     }
     100% {
-      transform: translate(890px, 42px) rotate(-2deg);
+      transform: translate(756px, 64px) rotate(-2deg);
     }
   }
 
   @keyframes land {
     0% {
-      transform: translate(-90px, 46px) rotate(-5deg);
+      transform: translate(44px, 64px) rotate(-5deg);
     }
     55% {
-      transform: translate(300px, 8px) rotate(4deg);
+      transform: translate(300px, 40px) rotate(4deg);
     }
     84% {
-      transform: translate(468px, 46px) rotate(-3deg);
+      transform: translate(468px, 62px) rotate(-3deg);
     }
     100% {
       transform: translate(500px, 84px) rotate(0deg);
@@ -255,7 +291,7 @@
       transform: scaleY(0.42);
     }
 
-    .chosen-halo {
+    .chosen-ring {
       transition: none;
     }
   }

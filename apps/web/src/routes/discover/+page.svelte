@@ -14,6 +14,8 @@
     clearFlow,
     emptyAnswers,
     fetchNakshatras,
+    fetchNakshatrasIn,
+    fetchNamingSystems,
     fetchRegions,
     fetchTraditions,
     intention as intentionInfo,
@@ -29,6 +31,8 @@
     FlowAnswers,
     IntentionId,
     Nakshatra,
+    NamedNakshatra,
+    NamingSystem,
     StepId,
     Tradition,
   } from '../../lib/discovery';
@@ -37,6 +41,7 @@
     intention: 'What matters',
     followup: 'A little more',
     tradition: 'Tradition',
+    culture: 'Cultural context',
     nakshatra: 'Nakshatra',
   };
 
@@ -48,8 +53,30 @@
   let traditions = $state<Tradition[]>([]);
   let nakshatras = $state<Nakshatra[]>([]);
   let regions = $state<string[]>([]);
-  let catalogState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  let catalogError = $state('');
+
+  /**
+   * Each optional lookup keeps its own state, because they feed different
+   * steps. Loaded together under one shared flag, a nakshatra request that
+   * failed would also blank out the traditions — so a single unavailable
+   * lookup would take the whole step with it. Neither list is discovery
+   * itself; they only decide which options are on offer.
+   */
+  let traditionsState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  let traditionsError = $state('');
+  let nakshatrasState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  let nakshatrasError = $state('');
+
+  /**
+   * The naming systems on offer, and the names served in the one that was
+   * chosen. Kept apart from the canonical list above on purpose: a naming
+   * system is optional context, so when it cannot be loaded the step falls
+   * back to the romanised names rather than losing the whole selection.
+   */
+  let namingSystems = $state<NamingSystem[]>([]);
+  let namingSystemsState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  let namingSystemsError = $state('');
+  let namingNakshatras = $state<NamedNakshatra[]>([]);
+  let namingState = $state<'idle' | 'loading' | 'ready' | 'error'>('idle');
 
   let nakshatraQuery = $state('');
   let finishing = $state(false);
@@ -70,31 +97,65 @@
           : 'Which Nakshatra should we look under?'
   );
 
+  /**
+   * The visitor asked for a naming system Everroot does not hold names in.
+   * They are still shown the twenty-seven — the sequence is the same in every
+   * naming system — but the step has to say that the spellings are not the
+   * ones they asked for, rather than quietly presenting romanised names as a
+   * match.
+   */
+  const namingUnsupported = $derived(
+    answers.naming !== '' &&
+      namingSystemsState === 'ready' &&
+      !namingSystems.some((system) => system.code === answers.naming)
+  );
+
+  /** The names to offer, in the chosen naming system when there is one. */
+  const activeNakshatras = $derived.by<NamedNakshatra[]>(() => {
+    if (answers.naming && namingNakshatras.length) return namingNakshatras;
+    return nakshatras.map((n) => ({ ...n }));
+  });
+
   const filteredNakshatras = $derived.by(() => {
     const q = nakshatraQuery.trim().toLowerCase();
-    if (!q) return nakshatras;
-    return nakshatras.filter((n) => n.name.toLowerCase().includes(q));
+    if (!q) return activeNakshatras;
+    // Matching on the canonical form as well means a visitor who knows the
+    // romanised name can still find the entry while reading it in their own
+    // naming system.
+    return activeNakshatras.filter(
+      (n) => n.name.toLowerCase().includes(q) || (n.canonical ?? '').toLowerCase().includes(q)
+    );
   });
 
   /**
-   * The tradition step asks for context, not for permission to continue. When
-   * the reviewed catalogue cannot be served there is nothing on the page to
-   * choose from, and an optional dataset must never hold the visitor at this
-   * question — the same is true when the catalogue is readable but has
-   * published nothing yet. While it is still loading, the question stands.
+   * The tradition step asks for context, not for permission to continue. The
+   * list it offers comes from local reference data, so the only way it can fail
+   * is the request itself — no API at the configured address, or a transport
+   * error — and an optional lookup must never hold the visitor at this
+   * question. The same is true when the list comes back empty. While it is
+   * still loading, the question stands.
    */
   const traditionSkippable = $derived(
-    catalogState === 'error' || (catalogState === 'ready' && traditions.length === 0)
+    traditionsState === 'error' || (traditionsState === 'ready' && traditions.length === 0)
   );
 
   const canContinue = $derived.by(() => {
-    if (step === 'intention') return answers.intention !== null;
+    if (step === 'intention') return answers.intention !== null || answers.followUpNote.trim().length > 0;
     if (step === 'followup') return follow?.choices ? answers.followUpChoice !== null : true;
     if (step === 'tradition') return answers.tradition !== null || traditionSkippable;
-    return true; // the nakshatra step is always skippable
+    // Both cultural steps are optional. Neither asks for anything the
+    // recommendation needs, so a visitor who wants only general discovery can
+    // pass straight through them.
+    return true;
   });
 
   const continueLabel = $derived.by(() => {
+    if (step === 'intention' && !answers.intention && answers.followUpNote.trim().length > 0) {
+      return 'Discover trees';
+    }
+    if (step === 'culture') {
+      return answers.naming || answers.tradition ? 'Continue' : 'Skip cultural context';
+    }
     if (step === 'nakshatra') {
       return answers.nakshatra
         ? 'See the associations on record'
@@ -126,20 +187,26 @@
     answers.tradition = null;
     answers.traditionName = '';
     answers.region = '';
+    answers.naming = '';
     answers.nakshatra = null;
+    answers.nakshatraName = '';
   }
 
   function chooseFollowUp(value: string) {
     answers.followUpChoice = value;
-    if (value === 'nakshatra') {
-      answers.tradition = NAKSHATRA_TRADITION;
-      answers.traditionName = 'Nakshatra tree association';
-    } else {
+    if (value !== 'nakshatra') {
       answers.tradition = null;
       answers.traditionName = '';
       answers.region = '';
+      answers.naming = '';
       answers.nakshatra = null;
+      answers.nakshatraName = '';
+      return;
     }
+    // Wanting a nakshatra is not an answer about which tradition it should be
+    // read in. It used to settle the tradition here, which is how the next
+    // step ended up showing one tradition's names to everybody. The cultural
+    // step now asks, and nothing is assumed from the visitor's other answers.
   }
 
   function chooseTradition(slug: string) {
@@ -147,12 +214,33 @@
     answers.traditionName = traditions.find((t) => t.slug === slug)?.name ?? slug;
     if (slug !== NAKSHATRA_TRADITION) {
       answers.region = '';
+      answers.naming = '';
       answers.nakshatra = null;
+      answers.nakshatraName = '';
     }
   }
 
-  function chooseNakshatra(name: string) {
-    answers.nakshatra = name;
+  /**
+   * `value` is the canonical name, so a selection made in any naming system
+   * still travels as the name the API and the reviewed records know. The
+   * spelling that was on the button is kept alongside it, so the result page
+   * can repeat the choice back the way the visitor made it.
+   */
+  function chooseNakshatra(value: string) {
+    const chosen = activeNakshatras.find((n) => (n.canonical ?? n.name) === value);
+    answers.nakshatra = value;
+    answers.nakshatraName = chosen?.name ?? value;
+  }
+
+  function chooseNaming(code: string) {
+    answers.naming = code;
+    // A nakshatra picked under one naming system is not the same choice
+    // spelled another way, so the selection is cleared rather than silently
+    // reinterpreted as a different name.
+    answers.nakshatra = null;
+    answers.nakshatraName = '';
+    nakshatraQuery = '';
+    void loadNamingNakshatras(code);
   }
 
   function togglePick(label: string) {
@@ -164,8 +252,15 @@
 
   function enter(target: StepId) {
     step = target;
-    if (target === 'tradition' || target === 'nakshatra') void ensureCatalog();
-    if (target === 'nakshatra') void loadRegions();
+    if (target === 'tradition' || target === 'culture' || target === 'nakshatra') {
+      void ensureCatalog();
+    }
+    if (target === 'culture') void loadNamingSystems();
+    if (target === 'nakshatra') {
+      void loadRegions();
+      // Re-entering with a naming system already chosen still needs its names.
+      if (answers.naming) void loadNamingNakshatras(answers.naming);
+    }
   }
 
   function next() {
@@ -204,6 +299,9 @@
   async function finish() {
     if (finishing) return;
     finishing = true;
+    if (!answers.intention) {
+      answers.intention = 'explore';
+    }
     const record: DiscoveryRecord = {
       id: uid(),
       createdAt: new Date().toISOString(),
@@ -220,27 +318,98 @@
 
   /* ------------------------------------------------------------- catalog */
 
-  async function ensureCatalog() {
-    if (catalogState === 'ready' || catalogState === 'loading') return;
-    catalogState = 'loading';
-    catalogError = '';
+  /**
+   * Load one optional list, keeping any failure to itself.
+   *
+   * The wording distinguishes a 404 (no API at the configured address), a 503
+   * (the API answered but this feature is unavailable) and a transport or
+   * configuration failure. It never says discovery is unavailable, because it
+   * never is: a missing list changes which options are offered, not whether a
+   * recommendation can be made.
+   */
+  async function loadTraditions() {
+    if (traditionsState === 'ready' || traditionsState === 'loading') return;
+    traditionsState = 'loading';
+    traditionsError = '';
     try {
-      const [t, n] = await Promise.all([fetchTraditions(), fetchNakshatras()]);
-      traditions = t;
-      nakshatras = n;
-      catalogState = 'ready';
+      traditions = await fetchTraditions();
+      traditionsState = 'ready';
     } catch (error) {
-      // The message distinguishes a 404 (no API at the configured address), a
-      // 503 (API up, reviewed records unavailable) and a transport or
-      // configuration failure. It never says the catalogue is empty.
-      catalogError = apiErrorMessage(error);
-      catalogState = 'error';
+      traditionsError = apiErrorMessage(error);
+      traditionsState = 'error';
     }
   }
 
-  async function reloadCatalog() {
-    catalogState = 'idle';
-    await ensureCatalog();
+  async function loadNakshatras() {
+    if (nakshatrasState === 'ready' || nakshatrasState === 'loading') return;
+    nakshatrasState = 'loading';
+    nakshatrasError = '';
+    try {
+      nakshatras = await fetchNakshatras();
+      nakshatrasState = 'ready';
+    } catch (error) {
+      nakshatrasError = apiErrorMessage(error);
+      nakshatrasState = 'error';
+    }
+  }
+
+  /** Both lookups, started together and answered independently. */
+  function ensureCatalog() {
+    void loadTraditions();
+    void loadNakshatras();
+  }
+
+  async function reloadTraditions() {
+    traditionsState = 'idle';
+    await loadTraditions();
+  }
+
+  async function reloadNakshatras() {
+    nakshatrasState = 'idle';
+    await loadNakshatras();
+  }
+
+  // The naming systems decide which spellings are offered, so like the
+  // tradition list they are reference vocabulary rather than a gate: a failure
+  // is reported on the step that shows them and never stops the journey.
+  async function loadNamingSystems() {
+    if (namingSystemsState === 'ready' || namingSystemsState === 'loading') return;
+    namingSystemsState = 'loading';
+    namingSystemsError = '';
+    try {
+      namingSystems = await fetchNamingSystems();
+      namingSystemsState = 'ready';
+    } catch (error) {
+      namingSystemsError = apiErrorMessage(error);
+      namingSystemsState = 'error';
+    }
+  }
+
+  async function reloadNamingSystems() {
+    namingSystemsState = 'idle';
+    await loadNamingSystems();
+  }
+
+  /**
+   * The names in one naming system. A failure leaves the romanised list in
+   * place — the visitor can still pick a nakshatra, they just see it under the
+   * spelling Everroot already had.
+   */
+  async function loadNamingNakshatras(code: string) {
+    if (!code) {
+      namingNakshatras = [];
+      namingState = 'idle';
+      return;
+    }
+    if (namingState === 'loading') return;
+    namingState = 'loading';
+    try {
+      namingNakshatras = await fetchNakshatrasIn(code);
+      namingState = 'ready';
+    } catch {
+      namingNakshatras = [];
+      namingState = 'error';
+    }
   }
 
   // The region list only narrows the query and is optional, so a failure is
@@ -282,8 +451,11 @@
     if (!list.includes(step)) step = list[list.length - 1];
 
     hydrated = true;
-    if (step === 'tradition' || step === 'nakshatra') void ensureCatalog();
+    if (step === 'tradition' || step === 'culture' || step === 'nakshatra') void ensureCatalog();
+    if (step === 'culture' || step === 'nakshatra') void loadNamingSystems();
     if (step === 'nakshatra') void loadRegions();
+    // A journey restored mid-way may already have chosen a naming system.
+    if (answers.naming) void loadNamingNakshatras(answers.naming);
   });
 
   // Persist the in-progress journey so Back, refresh and a return visit keep it.
@@ -332,8 +504,30 @@
 
         {#if step === 'intention'}
           <p class="step__intro">
-            There's no wrong answer. You can change direction at any time, and nothing you choose
-            here asks for a birth date, a birth time, or a birthplace.
+            Everroot discovers trees based on whatever is meaningful to you: culture, folklore,
+            spirituality, loved ones, ecology, or personal values. You can describe your intention in
+            your own words, explore along any path below, or combine them. These paths are examples,
+            not the limits of what Everroot can research.
+          </p>
+
+          <div class="field">
+            <label for="intent-free-text" class="picks__label">
+              Describe in your own words what you are seeking (optional)
+            </label>
+            <textarea
+              id="intent-free-text"
+              class="textarea"
+              maxlength={600}
+              bind:value={answers.followUpNote}
+              placeholder="e.g. A memorial tree for my grandmother who loved mountain rivers in Kyoto, something native and bird-friendly with autumn color..."
+            ></textarea>
+            <p class="field-hint">
+              Feel free to mention traditions, loved ones, environmental goals, or personal milestones.
+            </p>
+          </div>
+
+          <p class="picks__label" style="margin-top: 1.5rem;">
+            Or choose a discovery path (examples to start from):
           </p>
 
           <div class="choices" role="radiogroup" aria-labelledby="step-q">
@@ -348,6 +542,41 @@
                 onselect={chooseIntention}
               />
             {/each}
+          </div>
+
+          <div class="field" style="margin-top: 1.5rem;">
+            <details class="context-box">
+              <summary class="context-box__summary">
+                <strong>Optional context:</strong> planting region, soil, or cultural tradition
+              </summary>
+              <div class="context-box__body">
+                <div class="field">
+                  <label for="planting-region">Region or planting environment (optional)</label>
+                  <input
+                    id="planting-region"
+                    type="text"
+                    class="input"
+                    bind:value={answers.region}
+                    placeholder="e.g. Pacific Northwest, Mediterranean dry summer, clay soil, small garden"
+                  />
+                </div>
+                <div class="field">
+                  <label for="cultural-tradition">Cultural, spiritual, or regional context (optional)</label>
+                  <input
+                    id="cultural-tradition"
+                    type="text"
+                    class="input"
+                    bind:value={answers.traditionName}
+                    oninput={(e) => {
+                      const val = (e.target as HTMLInputElement).value;
+                      answers.tradition = val.trim() ? val : null;
+                      answers.traditionName = val;
+                    }}
+                    placeholder="e.g. Celtic folklore, Yoruba, Shinto, Vedic, local community tradition"
+                  />
+                </div>
+              </div>
+            </details>
           </div>
         {:else if step === 'followup'}
           {#if follow}
@@ -413,19 +642,21 @@
           {/if}
         {:else if step === 'tradition'}
           <p class="step__intro">
-            Only traditions that have published, reviewed records are listed here.
+            A tradition is cultural context for your answer, not a requirement. Choose one if it
+            helps explain what the tree should mean — or skip it entirely.
           </p>
 
-          {#if catalogState === 'loading'}
-            <p class="step__status" role="status">Loading the traditions on record…</p>
-          {:else if catalogState === 'error'}
+          {#if traditionsState === 'loading'}
+            <p class="step__status" role="status">Loading the traditions…</p>
+          {:else if traditionsState === 'error'}
             <div class="notice notice--warn" role="alert">
-              <p><strong>The catalogue could not be loaded.</strong> {catalogError}</p>
+              <p><strong>The list of traditions could not be loaded.</strong> {traditionsError}</p>
               <p class="notice__hint">
-                Cultural context is optional. You can continue without choosing a tradition — your
-                result does not depend on it.
+                This is only the list of traditions — your recommendation does not depend on it.
+                You can continue without choosing a tradition and Everroot will work from your
+                answers.
               </p>
-              <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadCatalog}>
+              <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadTraditions}>
                 Try again
               </button>
             </div>
@@ -451,18 +682,131 @@
               {/each}
             </div>
           {/if}
-        {:else if step === 'nakshatra'}
+        {:else if step === 'culture'}
           <p class="step__intro">
-            Choose one if you know it. If you don't, skip this step — Everroot will show you
-            everything else that is on record. You never need a birth date or a birth time.
+            Nothing here is assumed about you — not from your name, not from where you are, and not
+            from the answers you have given. Choose a tradition and a naming system if they help
+            explain what the tree should mean, or skip this and Everroot will suggest from your
+            answers alone.
           </p>
 
-          {#if catalogState === 'loading'}
-            <p class="step__status" role="status">Loading the nakshatras…</p>
-          {:else if catalogState === 'error'}
+          {#if !answers.tradition}
+            <!--
+              No tradition has been established yet, so it is asked for here rather
+              than settled behind the visitor's back. An earlier version of this flow
+              jumped straight from "I want a nakshatra" to a list of names in one
+              tradition's spelling, which made the question of whose tradition it was
+              unanswerable by the time it was asked.
+            -->
+            <h3 class="group__title" id="culture-tradition">Tradition or community</h3>
+
+            {#if traditionsState === 'loading'}
+              <p class="step__status" role="status">Loading the traditions…</p>
+            {:else if traditionsState === 'error'}
+              <div class="notice notice--warn" role="alert">
+                <p><strong>The list of traditions could not be loaded.</strong> {traditionsError}</p>
+                <p class="notice__hint">
+                  This is only the list of traditions — your recommendation does not depend on it.
+                  You can continue without choosing a tradition and Everroot will work from your
+                  answers.
+                </p>
+                <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadTraditions}>
+                  Try again
+                </button>
+              </div>
+            {:else}
+              <div class="choices choices--tight" role="radiogroup" aria-labelledby="culture-tradition">
+                {#each traditions as item (item.slug)}
+                  <SelectableCard
+                    name="culture-tradition"
+                    value={item.slug}
+                    selected={answers.tradition}
+                    label={item.name}
+                    description={item.slug === NAKSHATRA_TRADITION
+                      ? 'The 27 nakshatras and the trees recorded against them.'
+                      : 'Everroot holds no names in this tradition yet.'}
+                    icon={item.slug === NAKSHATRA_TRADITION ? 'sun' : 'book'}
+                    onselect={chooseTradition}
+                  />
+                {/each}
+              </div>
+            {/if}
+          {/if}
+
+          <h3 class="group__title" id="culture-naming">Naming system</h3>
+          <p class="group__hint">
+            Which names for the 27 nakshatras do you recognise? Leave this unset to see the
+            romanised names.
+          </p>
+
+          {#if namingSystemsState === 'loading'}
+            <p class="step__status" role="status">Loading the naming systems…</p>
+          {:else if namingSystemsState === 'error'}
             <div class="notice notice--warn" role="alert">
-              <p><strong>The catalogue could not be loaded.</strong> {catalogError}</p>
-              <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadCatalog}>
+              <p><strong>The naming systems could not be loaded.</strong> {namingSystemsError}</p>
+              <p class="notice__hint">
+                This only decides which spellings are shown. Continue and Everroot will use the
+                romanised names.
+              </p>
+              <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadNamingSystems}>
+                Try again
+              </button>
+            </div>
+          {:else}
+            <div class="choices choices--tight" role="radiogroup" aria-labelledby="culture-naming">
+              {#each namingSystems as system (system.code)}
+                <SelectableCard
+                  name="culture-naming"
+                  value={system.code}
+                  selected={answers.naming}
+                  label={system.name}
+                  description={system.endonym}
+                  onselect={chooseNaming}
+                />
+              {/each}
+            </div>
+          {/if}
+
+          {#if namingUnsupported}
+            <!--
+              Everroot was asked for a naming system it holds no names in. The 27 are
+              the same wherever you go, so the list is still shown — but as romanised
+              names, and said to be that, rather than presented as the ones that were
+              asked for.
+            -->
+            <div class="notice notice--info" role="status">
+              <p>Everroot has no names in that naming system yet.</p>
+              <p class="notice__hint">
+                The 27 are the same in every naming system, so the list below is in romanised
+                Sanskrit. Anything cultural the model says about them is written rather than
+                sourced, and may need confirming.
+              </p>
+            </div>
+          {/if}
+        {:else if step === 'nakshatra'}
+          <p class="step__intro">
+            Choose one if you know it. If you don't, skip this step — Everroot will suggest trees
+            from your answers alone. You never need a birth date or a birth time.
+          </p>
+
+          {#if answers.naming}
+            <p class="group__hint">
+              Showing the names in {namingSystems.find((s) => s.code === answers.naming)?.name ??
+                'your chosen naming system'}.
+            </p>
+          {/if}
+
+          {#if nakshatrasState === 'loading'}
+            <p class="step__status" role="status">Loading the nakshatras…</p>
+          {:else if nakshatrasState === 'error'}
+            <div class="notice notice--warn" role="alert">
+              <p><strong>The list of nakshatras could not be loaded.</strong> {nakshatrasError}</p>
+              <p class="notice__hint">
+                This is only the nakshatra list — it is optional, and your recommendation does not
+                depend on it. Skip this step and Everroot will suggest a tree from your answers
+                alone. You never need a birth date or a birth time.
+              </p>
+              <button class="btn btn--soft btn--sm retry" type="button" onclick={reloadNakshatras}>
                 Try again
               </button>
             </div>
@@ -485,11 +829,11 @@
               </p>
             {:else}
               <div class="nak-grid" role="radiogroup" aria-labelledby="step-q">
-                {#each filteredNakshatras as item (item.name)}
+                {#each filteredNakshatras as item ((item.canonical ?? item.name))}
                   <SelectableCard
                     dense
                     name="nakshatra"
-                    value={item.name}
+                    value={item.canonical ?? item.name}
                     selected={answers.nakshatra}
                     label={item.name}
                     badge={String(item.ordinal)}
@@ -639,6 +983,28 @@
     margin-top: 1.5rem;
   }
 
+  /* The cultural step asks two questions on one screen, so each needs a name
+     of its own. Kept to the same scale and colour as the step's other text
+     rather than introducing a heading level the flow has not used. */
+  .group__title {
+    margin: 1.4rem 0 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--color-charcoal, #2f3a30);
+  }
+
+  .group__hint {
+    margin: 0.3rem 0 0;
+    max-width: 62ch;
+    color: var(--color-charcoal-soft);
+    font-size: 0.92rem;
+    line-height: 1.6;
+  }
+
+  .choices--tight {
+    margin-top: 0.7rem;
+  }
+
   .choices--single {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -656,6 +1022,27 @@
     font-weight: 650;
     color: var(--color-charcoal-soft);
     margin-bottom: 0.5rem;
+  }
+
+  .context-box {
+    border: 1px solid var(--color-line-soft);
+    border-radius: var(--radius-md);
+    background: #fbfcf9;
+    padding: 0.85rem 1.15rem;
+  }
+
+  .context-box__summary {
+    cursor: pointer;
+    font-size: 0.92rem;
+    color: var(--color-charcoal);
+    user-select: none;
+  }
+
+  .context-box__body {
+    margin-top: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
   }
 
   .picks__row {

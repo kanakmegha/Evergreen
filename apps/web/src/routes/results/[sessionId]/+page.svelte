@@ -10,8 +10,11 @@
   import type { TreeOptionView } from '../../../lib/treeOption';
   import {
     askQuestion,
+    aiDiscoveryRequest,
+    candidateToSuggestion,
     clearFlow,
     discoveryRequest,
+    distinctSources,
     emptyAnswers,
     explanationFailureText,
     fetchCatalogue,
@@ -21,10 +24,12 @@
     loadDedication,
     loadRecord,
     loadSaved,
+    loadSessionToken,
     personalReflection,
     recommendationsRequest,
     removeDedication,
     resolveIntentionId,
+    runAIDiscovery,
     runDiscovery,
     runExplain,
     runRecommendations,
@@ -35,11 +40,14 @@
     usesNakshatra,
   } from '../../../lib/discovery';
   import type {
+    AICandidate,
+    AIDiscoveryResponse,
     DiscoveryRecord,
     DiscoveryRequestInput,
     EvidenceStatus,
     ExplanationEnvelope,
     RecommendationSuggestion,
+    ResearchSource,
     TreeFact,
   } from '../../../lib/discovery';
 
@@ -88,6 +96,18 @@
   let suggestionsStatus = $state('');
   let suggestionsLoading = $state(false);
   let suggestionNotice = $state('');
+
+  /**
+   * The research-backed discovery, when it answered.
+   *
+   * It is fetched beside the suggestion call rather than instead of it, and it
+   * is allowed to be absent: a page that could not research still has an
+   * answer to show, and the provenance section simply does not render. What it
+   * must never do is render a research panel from sources that were not
+   * actually retrieved — which is why this stays null rather than defaulting
+   * to an empty "researched" result.
+   */
+  let aiDiscovery = $state<AIDiscoveryResponse | null>(null);
   /**
    * The one question the model asked because a missing fact would have changed
    * its suggestions. It arrives beside the answer, never instead of it, and it
@@ -181,8 +201,6 @@
 
   const answers = $derived(record?.answers ?? emptyAnswers());
   const chosenIntention = $derived(intentionInfo(answers.intention));
-  const queryable = $derived(discoveryRequest(answers) !== null);
-  const needsNakshatra = $derived(usesNakshatra(answers) && !answers.nakshatra);
   const recommendations = $derived(record?.discovery?.recommendations ?? []);
   const hasResults = $derived(
     record?.discovery?.status === 'verified_results' && recommendations.length > 0
@@ -210,6 +228,78 @@
         suggestionOption(suggestion, index, 'shortlist', culturalAssociation)
       )
   );
+
+  /* ------------------------------------------------ research provenance */
+
+  /**
+   * What actually happened during research, as the pipeline recorded it.
+   *
+   * It is read from the response rather than inferred from whether sources are
+   * present, because the two are not the same statement: an answer can carry
+   * no sources because nothing was researched, or because research ran and
+   * found nothing worth citing. Only the first of those is an outage, and only
+   * the second could ever be shown without a caveat.
+   */
+  const researchStatus = $derived(aiDiscovery?.researchStatus ?? null);
+  const researchSummary = $derived(aiDiscovery?.researchSummary ?? '');
+  const unverifiedAreas = $derived(aiDiscovery?.unverifiedAreas ?? []);
+  const researchDisclaimer = $derived(aiDiscovery?.disclaimer ?? '');
+
+  /** Every source the answer drew on, in first-cited order. */
+  const consultedSources = $derived<ResearchSource[]>(
+    aiDiscovery ? distinctSources(aiDiscovery) : []
+  );
+
+  /**
+   * The AI candidates, kept alongside the suggestion views rather than
+   * replacing them, so the provenance panel can name the exact candidate a
+   * claim belongs to even when the shortlist was drawn from another source.
+   */
+  const aiCandidates = $derived<AICandidate[]>(aiDiscovery?.candidates ?? []);
+
+  /** Renders one candidate's support in the words the vocabulary defines. */
+  function evidenceSummary(candidate: AICandidate): string {
+    const parts: string[] = [];
+    const cultural = candidate.culturalSignificance;
+    const ecological = candidate.ecologicalFit;
+
+    if (cultural?.evidence === 'sourced' && (cultural.sourceIds?.length ?? 0) > 0) {
+      parts.push('cultural claim backed by a source');
+    } else if (cultural?.evidence === 'interpretation') {
+      parts.push('cultural reading, not a documented fact');
+    } else if (cultural?.evidence === 'user_defined') {
+      parts.push('meaning you supplied yourself');
+    } else if (cultural?.evidence === 'uncertain') {
+      parts.push('cultural claim only partly supported');
+    } else {
+      parts.push('no cultural evidence found');
+    }
+
+    if (ecological?.evidence === 'sourced' && (ecological.sourceIds?.length ?? 0) > 0) {
+      parts.push('regional fit backed by a source');
+    } else {
+      parts.push('regional fit not evidenced');
+    }
+
+    const identity = candidate.identity?.status;
+    if (identity === 'confirmed') parts.push('botanical name confirmed');
+    else if (identity === 'not_found') parts.push('botanical name not found in the taxonomy record');
+    else if (identity === 'unverified') parts.push('botanical name could not be checked');
+
+    parts.push(`confidence ${candidate.confidence?.level ?? 'low'}`);
+    return parts.join(' · ');
+  }
+
+  /** A retrieval date in the visitor's own locale, without the time. */
+  function formatRetrieved(iso: string): string {
+    const parsed = new Date(iso);
+    if (Number.isNaN(parsed.getTime())) return 'date unknown';
+    return parsed.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  }
 
   /**
    * The botanical records the shortlist falls back to. The explanation endpoint
@@ -284,17 +374,24 @@
         ? 'One tree suggested from your answers — general botany written by the AI model, not a reviewed cultural record.'
         : `${suggestionViews.length} trees suggested from your answers — general botany written by the AI model, not a reviewed cultural record.`;
     }
-    if (needsNakshatra) {
-      return 'You skipped the Nakshatra step, so there is no cultural record to check. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
-    }
-    if (!queryable) {
-      return 'Your answers are outside Everroot’s reviewed cultural dataset, so there is no cultural record to check. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
-    }
-    return 'There is no reviewed cultural association on record for this selection yet. Rather than guess, Everroot shows the botanical records it can stand behind—these are not Nakshatra recommendations.';
+    // Nothing came back from the model, so the shortlist is what the botanical
+    // reference holds. That is a normal outcome rather than a failure, and it
+    // is not one caused by which cultural answers the visitor gave or skipped
+    // — nothing is being withheld from them, so there is nothing here to warn
+    // them about. The note beneath the shortlist is where the difference
+    // between a suggestion and a record gets explained.
+    if (!shortlist.length) return '';
+    return shortlist.length === 1
+      ? 'One tree from the botanical reference that fits your answers, with its general botany.'
+      : `${shortlist.length} trees from the botanical reference that fit your answers, with their general botany.`;
   });
 
-  /** The dataset-bound framing is a notice; a suggestion is simply what it says it is. */
-  const ledeIsNotice = $derived(!hasResults && !suggestionViews.length);
+  /**
+   * The lede is a description, never a warning. Nothing about it depends on
+   * which cultural answers were given or skipped, so it is never dressed as a
+   * notice — a visitor whose cultural selection found nothing is not being
+   * told they did something wrong.
+   */
 
   /**
    * A discreet indicator of what backs the page, not a promise about the trees.
@@ -444,10 +541,21 @@
   /**
    * Tree suggestions from the visitor's answers: the first call this page makes
    * and the only one that needs neither the database nor the botanical
-   * catalogue. It is allowed to fail on its own terms — a failure is recorded
-   * as a failure, never turned into an empty list — and when it produces
-   * nothing, the exploration call below still runs so the shortlist is never
-   * left blank by one unavailable service.
+   * catalogue.
+   *
+   * The research-backed discovery is tried first, because it is the only call
+   * that can attach a source to a claim. It must be tried first rather than in
+   * parallel with the suggestion call: a shortlist drawn from one endpoint and
+   * provenance drawn from another would let a sourced claim sit underneath a
+   * card it never supported. So the two are alternatives — exactly one model
+   * call is made per view — and whichever produced the cards is the one whose
+   * provenance is shown.
+   *
+   * When it is unavailable the older suggestion call runs and the provenance
+   * panel simply does not render. That absence is deliberate: the honest empty
+   * state for "we have no research record" is not to claim any provenance, not
+   * to display a panel of caveats beside an answer nobody looked anything up
+   * for.
    */
   async function loadSuggestions() {
     // One request per result, and never a second while one is in flight: these
@@ -456,35 +564,71 @@
     suggestionsLoading = true;
     suggestionNotice = '';
     suggestionsQuestion = '';
+    suggestionsEvidence = null;
+    aiDiscovery = null;
     birdPhase = 'flying';
     clearTimeout(birdTimer);
+
+    let produced = false;
     try {
-      const response = await runRecommendations(recommendationsRequest(answers));
-      suggestions = response.suggestions;
-      suggestionsEvidence = response.evidence;
-      suggestionsStatus = response.status;
-      suggestionsQuestion = response.followUpQuestion ?? '';
-      if (suggestions.length) {
-        // There is a tree to rest on, so the bird comes down onto it. A visitor
-        // who asked for no motion goes straight to the finished picture.
-        birdPhase = prefersStillness() ? 'landed' : 'landing';
-        birdTimer = setTimeout(() => (birdPhase = 'landed'), 1600);
+      const researched = await runAIDiscovery(aiDiscoveryRequest(answers), loadSessionToken() ?? undefined);
+      if (researched.candidates.length) {
+        aiDiscovery = researched;
+        suggestions = researched.candidates.map(candidateToSuggestion);
+        // No gate verdict travels with a research pass. The publication gate
+        // only ever reports on a REVIEWED association, and this answer has
+        // none — leaving the evidence null means the cards claim no reviewed
+        // match, which is exactly what is true of them.
+        suggestionsEvidence = null;
+        suggestionsStatus = researched.status;
+        suggestionsQuestion = researched.followUpQuestion ?? '';
+        produced = true;
       } else {
-        birdPhase = '';
+        // An honest empty answer from the model is still an answer, and it
+        // must not be retried by the older endpoint as though it were a
+        // failure. The provenance panel has something to say about it: no
+        // candidates, and why.
+        aiDiscovery = researched;
+        suggestions = [];
+        suggestionsStatus = researched.status;
+        suggestionsQuestion = researched.followUpQuestion ?? '';
+        produced = true;
       }
-    } catch (error) {
-      suggestions = [];
-      suggestionsEvidence = null;
-      suggestionsStatus = '';
-      suggestionsQuestion = '';
+    } catch {
+      // The research pass is optional. Falling through to the older endpoint
+      // keeps the shortlist working while the new one is unconfigured, and the
+      // panel stays hidden so nothing implies a research record exists.
+      aiDiscovery = null;
+    }
+
+    if (!produced) {
+      try {
+        const response = await runRecommendations(recommendationsRequest(answers));
+        suggestions = response.suggestions;
+        suggestionsEvidence = response.evidence;
+        suggestionsStatus = response.status;
+        suggestionsQuestion = response.followUpQuestion ?? '';
+      } catch (error) {
+        suggestions = [];
+        suggestionsEvidence = null;
+        suggestionsStatus = '';
+        suggestionsQuestion = '';
+        suggestionNotice =
+          error instanceof Error ? error.message : 'Tree suggestions are unavailable right now.';
+      }
+    }
+
+    if (suggestions.length) {
+      // There is a tree to rest on, so the bird comes down onto it. A visitor
+      // who asked for no motion goes straight to the finished picture.
+      birdPhase = prefersStillness() ? 'landed' : 'landing';
+      birdTimer = setTimeout(() => (birdPhase = 'landed'), 1600);
+    } else {
       // Nothing landed, so the scene goes away with it: a picture of success
       // over a failed call would be the same lie as an empty list.
       birdPhase = '';
-      suggestionNotice =
-        error instanceof Error ? error.message : 'Tree suggestions are unavailable right now.';
-    } finally {
-      suggestionsLoading = false;
     }
+    suggestionsLoading = false;
     if (!suggestions.length) void loadExploration();
   }
 
@@ -671,8 +815,7 @@
           </div>
 
           {#if lede}
-            <p class="summary__lede" class:summary__lede--notice={ledeIsNotice}>
-              {#if ledeIsNotice}<Icon name="info" size={17} />{/if}
+            <p class="summary__lede">
               <span>{lede}</span>
             </p>
           {/if}
@@ -710,7 +853,10 @@
             {#if showNakshatraFact}
               <div class="fact">
                 <dt>Nakshatra</dt>
-                <dd>{answers.nakshatra ?? 'Skipped'}</dd>
+                <!-- Repeated back in the naming system it was chosen in, not in a
+                     transliteration of it. The canonical name is what was sent on;
+                     this is what the visitor read when they picked it. -->
+                <dd>{answers.nakshatraName || answers.nakshatra || 'Skipped'}</dd>
               </div>
             {/if}
             {#if showTraditionFacts}
@@ -843,6 +989,108 @@
               <p class="save-status" role="status">{saveStatus}</p>
             {/if}
           </section>
+        {/if}
+
+        <!-- ------------------------------------- B2. what this rests on -->
+        <!-- The honest account of how the answer above was produced: what was
+             researched, which claims a source backs, and which do not. It sits
+             with the shortlist rather than in a footer because a visitor should
+             be able to see the provenance of a claim at the same moment they
+             read the claim.
+             It renders only when a discovery actually came back: an absent
+             panel and a panel full of caveats would mean different things, and
+             the honest empty state is simply not to claim any provenance. -->
+        {#if aiDiscovery}
+        <section class="card-surface panel" style="margin: 1.5rem 0; padding: 1.25rem;" aria-labelledby="provenance-title">
+          <h2 id="provenance-title" style="font-size: 1.15rem; font-weight: 650; margin-bottom: 0.5rem;">
+            What this answer rests on
+          </h2>
+
+          {#if researchStatus === 'unavailable'}
+            <!-- A discovery that could not be researched is still an answer, but
+                 it must never read as a sourced one. Saying so plainly is the
+                 whole point of the field. -->
+            <p class="notice notice--info banner" role="status" style="margin-bottom: 0.75rem;">
+              Nothing was researched for this answer, so it comes from general
+              botanical knowledge rather than from sources. Treat the tree ideas
+              as a starting point to check, not as documented findings.
+            </p>
+          {:else if researchStatus === 'partial'}
+            <p class="notice notice--info banner" role="status" style="margin-bottom: 0.75rem;">
+              Partly researched: some sources were retrieved, but at least one
+              source could not be reached. The findings below are real; the
+              search was simply incomplete.
+            </p>
+          {/if}
+
+          {#if researchSummary}
+            <p style="font-size: 0.9rem; color: #53645c; margin-bottom: 0.75rem;">{researchSummary}</p>
+          {/if}
+
+          {#if unverifiedAreas.length}
+            <div style="margin-bottom: 0.75rem;">
+              <h3 style="font-size: 0.95rem; font-weight: 620; margin-bottom: 0.35rem;">Not settled by the sources</h3>
+              <ul style="margin: 0; padding-left: 1.1rem; font-size: 0.9rem; color: #53645c;">
+                {#each unverifiedAreas as area (area)}
+                  <li style="margin-bottom: 0.2rem;">{area}</li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+
+          {#if consultedSources.length}
+            <div style="margin-bottom: 0.75rem;">
+              <h3 style="font-size: 0.95rem; font-weight: 620; margin-bottom: 0.35rem;">
+                Sources consulted ({consultedSources.length})
+              </h3>
+              <ul style="list-style: none; margin: 0; padding: 0;">
+                {#each consultedSources as source (source.id)}
+                  <li style="margin-bottom: 0.6rem; font-size: 0.88rem;">
+                    <a href={source.url} target="_blank" rel="noopener noreferrer nofollow"
+                       style="color: #27664e; font-weight: 560;">
+                      {source.title}{source.publisher ? ` — ${source.publisher}` : ''}
+                    </a>
+                    <span style="color: #68756c;">
+                      · {source.kind.replace(/_/g, ' ')}
+                      · retrieved {formatRetrieved(source.retrievedAt)}
+                    </span>
+                    {#if source.snippet}
+                      <p style="margin: 0.15rem 0 0; color: #53645c;">{source.snippet}</p>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {:else if researchStatus !== 'unavailable'}
+            <p style="font-size: 0.88rem; color: #68756c; margin-bottom: 0.75rem;">
+              No sources are attached to this answer, so no claim below should be
+              read as documented.
+            </p>
+          {/if}
+
+          {#if aiCandidates.length}
+            <div>
+              <h3 style="font-size: 0.95rem; font-weight: 620; margin-bottom: 0.35rem;">How well each claim is supported</h3>
+              <ul style="list-style: none; margin: 0; padding: 0;">
+                {#each aiCandidates as candidate (candidate.name + candidate.scientificName)}
+                  <li style="margin-bottom: 0.6rem; font-size: 0.88rem; color: #53645c;">
+                    <strong style="color: #1e332a;">{candidate.name}</strong>
+                    — {evidenceSummary(candidate)}
+                  </li>
+                {/each}
+              </ul>
+              <p style="font-size: 0.8rem; color: #68756c; margin-top: 0.35rem;">
+                Confidence is the model's own read of the retrieved sources. It is
+                not a measured score of evidence quality, and it is never a
+                review of the cultural claim.
+              </p>
+            </div>
+          {/if}
+
+          {#if researchDisclaimer}
+            <p style="font-size: 0.8rem; color: #68756c; margin-top: 0.75rem;">{researchDisclaimer}</p>
+          {/if}
+        </section>
         {/if}
 
         <!-- ----------------------------- Ask Everroot AI Question Section -->
@@ -1291,23 +1539,6 @@
     color: var(--color-charcoal-soft);
     line-height: 1.65;
     font-size: 0.98rem;
-  }
-
-  .summary__lede--notice {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    padding: 0.7rem 0.85rem;
-    border-radius: var(--radius-control);
-    background: #f6f4ea;
-    border: 1px solid var(--color-line);
-    color: #4d5240;
-  }
-
-  .summary__lede--notice :global(svg) {
-    flex: none;
-    margin-top: 0.2rem;
-    color: var(--color-earth);
   }
 
   /* A question beside the answer: quieter than the notice, because it is an

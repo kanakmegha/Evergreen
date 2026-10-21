@@ -45,7 +45,6 @@ paths:
           content:
             application/json:
               schema: { type: array, items: { type: string } }
-        '503': { description: Region catalog unavailable }
   /api/v1/nakshatras:
     get:
       operationId: listNakshatras
@@ -55,6 +54,33 @@ paths:
           content:
             application/json:
               schema: { type: array, items: { $ref: '#/components/schemas/Nakshatra' } }
+  /api/v1/naming-systems:
+    get:
+      operationId: listNamingSystems
+      responses:
+        '200':
+          description: Naming systems Everroot holds nakshatra names for
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/NamingSystem' } }
+  /api/v1/nakshatras/{naming}:
+    get:
+      operationId: listNakshatrasInNamingSystem
+      parameters:
+        - in: path
+          name: naming
+          required: true
+          schema: { type: string }
+          description: >
+            A code from /api/v1/naming-systems. An unrecognised code returns the
+            canonical romanised list, since the sequence is the same in every
+            naming system and only the spelling differs.
+      responses:
+        '200':
+          description: The 27 nakshatras as this naming system names them, each with its canonical form
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/NamedNakshatra' } }
   /api/v1/discoveries:
     post:
       operationId: discoverByNakshatra
@@ -160,10 +186,303 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecommendationsResponse' }
-        '400': { description: Unsupported intention, invalid selection or limit }
+        '400': { description: Missing or out-of-range intention; invalid selection or limit }
         '429': { description: Model is busy; the response carries a Retry-After header }
         '502': { description: The model replied with something Everroot could not read }
         '503': { description: AI recommendation service not configured or temporarily unavailable }
+  /api/v1/discovery:
+    post:
+      operationId: discoverAI
+      description: >
+        The AI-first discovery pipeline: interpret the visitor's answers,
+        research sources dynamically, generate candidates grounded in what was
+        retrieved, verify each claimed binomial against a taxonomic record,
+        then repair what the server owns — citations, confidence definitions
+        and identity. It reads no catalogue table, so a visitor gets an answer
+        with the database empty or unreachable. A research failure is a
+        labelled downgrade: the reply still answers 200 with researchStatus
+        "unavailable". A model failure is an error (429 rate limited, 503 not
+        configured or temporarily unavailable, 502 unreadable reply) and never
+        an empty candidate list. Distinct from POST /api/v1/discoveries —
+        which can only return what the publication gate has approved — this
+        endpoint is machine-written and attributes every claim to the sources
+        retrieved for that request. A caller that presents a session token has
+        the answer saved and receives its runId; a caller without one receives
+        saved=false.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AIDiscoveryRequest' }
+      responses:
+        '200':
+          description: >
+            status is "ok" when candidates were produced and "no_candidates"
+            when the model found nothing it would stand behind — an honest
+            answer rather than a failure. researchStatus is the pipeline's own
+            record of what happened ("researched", "partial" or
+            "unavailable") and never the model's claim. A request whose
+            research failed still answers 200, with its candidates marked
+            provisional.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AIDiscoveryResponse' }
+        '400':
+          description: >
+            Invalid JSON; a missing or out-of-range intention; a description
+            over 2000 characters; an invalid selection; too many or over-long
+            constraints; or a limit outside 1-5.
+        '429': { description: Model is busy; the response carries a Retry-After header }
+        '502': { description: The model replied with something Everroot could not read }
+        '503': { description: AI discovery service not configured or temporarily unavailable }
+    get:
+      operationId: listDiscoveries
+      description: >
+        Lists the caller's own saved discoveries, newest first, at most 20 of
+        them. There is no query parameter that can widen that and no id that
+        can be supplied to reach someone else's.
+      parameters:
+        - in: header
+          name: Authorization
+          required: true
+          schema: { type: string }
+          description: >
+            `Bearer <token>` as issued by POST /api/v1/session. A missing
+            or unusable token is a 401.
+      responses:
+        '200':
+          description: >
+            The caller's own discoveries, newest first. An empty list means
+            none have been saved yet.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [discoveries]
+                properties:
+                  discoveries: { type: array, items: { $ref: '#/components/schemas/SavedDiscoverySummary' } }
+        '401': { description: No session token was presented or the token is no longer valid }
+        '503': { description: Saving discoveries is temporarily unavailable }
+  /api/v1/session:
+    post:
+      operationId: createSession
+      description: >
+        Issues an optional anonymous session token, which is how a visitor
+        keeps their own discoveries readable later without Everroot knowing
+        who they are. The token is returned exactly once and is not
+        recoverable afterwards — only its hash is stored — and this flow asks
+        for no email, no name and no date of birth anywhere.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionRequest' }
+      responses:
+        '201':
+          description: Anonymous session token issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { description: Invalid JSON body or a handle longer than 60 characters }
+        '503': { description: Saving discoveries is temporarily unavailable }
+  /api/v1/discovery/{id}:
+    get:
+      operationId: getDiscovery
+      description: Reads one saved discovery the caller owns together with its result payload and the sources its citations point at.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+          description: The runId returned when this discovery was saved.
+        - in: header
+          name: Authorization
+          required: true
+          schema: { type: string }
+          description: >
+            `Bearer <token>` as issued by POST /api/v1/session. A missing
+            or unusable token is a 401.
+      responses:
+        '200':
+          description: The saved discovery
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedDiscovery' }
+        '401': { description: No session token was presented or the token is no longer valid }
+        '404':
+          description: >
+            No discovery with that id, or one this token does not own —
+            deliberately identical, so an id cannot be used to discover which
+            discoveries exist.
+        '503': { description: Saving discoveries is temporarily unavailable }
+    delete:
+      operationId: deleteDiscovery
+      description: Deletes one saved discovery the caller owns. An id that is not theirs reads as a missing discovery — deliberately identical to one that never existed.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+          description: The runId returned when this discovery was saved.
+        - in: header
+          name: Authorization
+          required: true
+          schema: { type: string }
+          description: >
+            `Bearer <token>` as issued by POST /api/v1/session. A missing
+            or unusable token is a 401.
+      responses:
+        '204': { description: Discovery deleted }
+        '401': { description: No session token was presented or the token is no longer valid }
+        '404':
+          description: >
+            No discovery with that id, or one this token does not own —
+            deliberately identical, so an id cannot be used to discover which
+            discoveries exist.
+        '503': { description: Saving discoveries is temporarily unavailable }
+  /api/v1/questions:
+    post:
+      operationId: askQuestion
+      description: >
+        Answers one open question from the configured model. The input is
+        validated, one prompt is built (internal/ai/qa.go) and the model's
+        answer comes back with its prompt version, model and disclaimer.
+        PostgreSQL is not on the answer path: the interaction is persisted
+        afterwards and best-effort, so a database outage never turns a
+        successful answer into a failure and a failed write never withholds
+        the answer. The intention and context a visitor supplies are written
+        into the prompt as context; sessionId is used only to group the
+        persisted interaction and is never sent to the model. Only the
+        failure classification is ever logged — never the question, the
+        answer or the provider's reply.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuestionRequest' }
+      responses:
+        '200':
+          description: >
+            status is "ok". interactionId is the id of the persisted
+            interaction when the database accepted the write and a generated
+            UUID when it did not — it is always present and never means the
+            answer failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuestionResponse' }
+        '400':
+          description: >
+            Invalid JSON; an empty question; a question over 1000 characters;
+            or an intention over 100 characters.
+        '429': { description: Model is busy; the response carries a Retry-After header }
+        '502': { description: The model replied with something Everroot could not read }
+        '503': { description: AI question service not configured or temporarily unavailable }
+  /api/v1/ask:
+    post:
+      operationId: askQuestionAlias
+      description: >
+        An alias of POST /api/v1/questions — the same handler, the same
+        request and response schemas and the same behaviour, so either
+        spelling reaches one implementation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuestionRequest' }
+      responses:
+        '200':
+          description: The answer exactly as POST /api/v1/questions returns it
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuestionResponse' }
+        '400':
+          description: >
+            Invalid JSON; an empty question; a question over 1000 characters;
+            or an intention over 100 characters.
+        '429': { description: Model is busy; the response carries a Retry-After header }
+        '502': { description: The model replied with something Everroot could not read }
+        '503': { description: AI question service not configured or temporarily unavailable }
+  /api/v1/feedback:
+    post:
+      operationId: submitFeedback
+      description: >
+        Records feedback on an answer or on the site. The write is
+        independent of answer generation and best-effort: with no database
+        the request is still answered ok, saying persistence is offline
+        rather than pretending a row was stored. interactionId is recorded
+        only when it is well-formed as a UUID; any other value is stored as
+        null rather than rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FeedbackRequest' }
+      responses:
+        '200':
+          description: >
+            Feedback accepted — either recorded or received with persistence
+            offline. The message field says which.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, message]
+                properties:
+                  status: { type: string, const: ok }
+                  message: { type: string, example: 'Thank you for your feedback' }
+        '400':
+          description: >
+            Invalid JSON; a feedback type over 50 characters; or a comment or
+            correction over 2000 characters.
+        '503': { description: The feedback could not be recorded }
+  /api/v1/conversation:
+    get:
+      operationId: conversationGet
+      description: >
+        Reads one conversational session as it stands now, so a returning
+        visitor can resume the flow. An unknown id and an expired one are the
+        same 404, because the lookup only ever returns sessions that have not
+        expired.
+      parameters:
+        - in: query
+          name: session_id
+          required: true
+          schema: { type: string, minLength: 1 }
+          description: The session_id returned by POST /api/v1/conversation.
+      responses:
+        '200':
+          description: The session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationSession' }
+        '400': { description: session_id was not supplied }
+        '404': { description: No unexpired session with that id }
+    post:
+      operationId: conversation
+      description: >
+        Advances the conversational discovery flow one turn. session_id
+        continues an existing session and omitting it starts a new one; the
+        visitor's turn arrives as an intent (celebrate, remember, explore,
+        grow or curious) or as a free-text message. The reply carries the
+        next state and the short clickable replies for it. Tree suggestions
+        appear only inside recommendations, and they are the same validated
+        suggestion object POST /api/v1/recommendations returns, so a result
+        rendered from a conversation and one rendered from the form are the
+        same object. A failure in the session store or the model is reported
+        as conversation unavailable — never as an empty success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationRequest' }
+      responses:
+        '200':
+          description: The turn was processed; state says where the flow now stands
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationResponse' }
+        '400': { description: Invalid JSON or an unknown field }
+        '503': { description: Conversation unavailable — the session store or the model could not be reached }
   /internal/v1/review/queue:
     get:
       operationId: reviewQueue
@@ -348,6 +667,25 @@ components:
       properties:
         name: { type: string }
         ordinal: { type: integer, minimum: 1, maximum: 27 }
+    NamingSystem:
+      type: object
+      required: [code, name, endonym, script]
+      properties:
+        code: { type: string, example: ta }
+        name: { type: string, example: Tamil }
+        endonym: { type: string, example: 'தமிழ்' }
+        script: { type: string, example: Tamil }
+    NamedNakshatra:
+      type: object
+      required: [name, ordinal, canonical]
+      description: >
+        One nakshatra as a chosen naming system names it. `canonical` is always
+        the romanised Sanskrit form, so a display name never doubles as a lookup
+        key and a visitor's choice still reaches the same record.
+      properties:
+        name: { type: string, example: 'அசுவினி' }
+        ordinal: { type: integer, minimum: 1, maximum: 27 }
+        canonical: { type: string, example: Ashwini }
     DiscoveryRequest:
       type: object
       additionalProperties: false
@@ -592,7 +930,16 @@ components:
       additionalProperties: false
       required: [intention]
       properties:
-        intention: { type: string, enum: [personal, remember, culture, future, explore] }
+        intention:
+          type: string
+          minLength: 3
+          maxLength: 300
+          description: >
+            Either one of the known keys — personal, remember, culture,
+            future, explore — which maps to its existing label, or free text
+            of 3 to 300 characters, which reaches the model as the visitor's
+            own question instead of being refused with a 400. An empty
+            intention is the only refusal.
         answer:
           type: string
           maxLength: 700
@@ -641,7 +988,7 @@ components:
         status: { type: string, enum: [ok, no_suggestions] }
         suggestions: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/Suggestion' } }
         evidence: { $ref: '#/components/schemas/EvidenceStatus' }
-        promptVersion: { type: string, example: v1.3-visitor-anchored-reasons }
+        promptVersion: { type: string, example: v1.4-visitor-anchored-reasons }
         model: { type: string }
         disclaimer: { type: string, description: Present so an API consumer must invent no wording of its own for what the text is. }
         followUpQuestion:
@@ -652,3 +999,428 @@ components:
             materially change the suggestions; it is a question about the
             visitor's circumstances and never a substitute for the answer, which
             arrives in the same reply.
+    AIDiscoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [intention]
+      properties:
+        intention:
+          type: string
+          minLength: 3
+          maxLength: 300
+          description: >
+            Either one of the known interface keys (personal, remember,
+            culture, future, explore), which keeps its existing label, or the
+            visitor's own free text. Anything that is not a known key is
+            passed through as free text so an unfamiliar question reaches the
+            model instead of being refused with a 400. The bounds are about
+            abuse rather than about subject matter: an empty intention is the
+            only refusal.
+        description:
+          type: string
+          maxLength: 2000
+          description: The visitor's own account of what they want, in their words.
+        tradition:
+          type: string
+          maxLength: 100
+          description: Context the visitor chose to give. Never required and never licenses a claim by itself.
+        region:
+          type: string
+          maxLength: 100
+          description: Context the visitor chose to give. Never required and never licenses a claim by itself.
+        nakshatra:
+          type: string
+          maxLength: 100
+          description: Context the visitor chose to give. Never required and never licenses a claim by itself.
+        constraints:
+          type: array
+          maxItems: 20
+          items: { type: string, maxLength: 500 }
+          description: Practical requirements the visitor named — space, light, climate and care.
+        limit: { type: integer, minimum: 1, maximum: 5, default: 3 }
+    AIDiscoveryResponse:
+      type: object
+      required: [status, candidates, sources, researchStatus, researchSummary, confidenceDefinitions, promptVersion, model, disclaimer, saved]
+      properties:
+        status: { type: string, enum: [ok, no_candidates] }
+        candidates: { type: array, maxItems: 5, items: { $ref: '#/components/schemas/DiscoveryCandidate' } }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/ResearchSource' }
+          description: The retrieved findings, carrying the ids the candidates cite so every citation resolves to a real address.
+        researchStatus:
+          type: string
+          enum: [researched, partial, unavailable]
+          description: >
+            The pipeline's own record of what happened, never the model's
+            claim. "unavailable" is a labelled downgrade rather than an
+            error — research failing is not a request failing — and
+            "partial" means some backends answered while at least one was
+            unavailable. A research failure never turns into a non-200.
+        researchSummary:
+          type: string
+          description: One line describing what was retrieved, so a visitor can tell a researched answer from a provisional one.
+        unverifiedAreas:
+          type: array
+          maxItems: 6
+          items: { type: string }
+          description: Dimensions the sources did not settle. Omitted when there are none.
+        followUpQuestion:
+          type: string
+          description: >
+            Omitted when absent. Present only when one missing fact would
+            materially change the answer. It travels beside the candidates
+            and never stands in for one.
+        confidenceDefinitions:
+          type: object
+          description: The published meaning of each confidence level, written by the server so a level is never read as an independently measured score.
+          required: [high, moderate, low, insufficient]
+          properties:
+            high: { type: string }
+            moderate: { type: string }
+            low: { type: string }
+            insufficient: { type: string }
+        promptVersion: { type: string, example: v1.0-research-grounded }
+        model: { type: string }
+        disclaimer: { type: string, description: Present so an API consumer must invent no wording of its own for what the text is. }
+        runId:
+          type: string
+          maxLength: 64
+          description: Present only when saved is true. It names a row the caller owns and can read back with their session token.
+        saved:
+          type: boolean
+          description: Whether the answer was kept for this caller. false with a session token means the save did not happen — the answer itself is still shown.
+    DiscoveryCandidate:
+      type: object
+      description: One tree the model offers, with everything the results page needs to render a card without inventing anything.
+      required: [name, scientificName, whyItMatches, botanicalDetail, matureSize, culturalSignificance, ecologicalFit, identity, confidence]
+      properties:
+        name: { type: string }
+        scientificName:
+          type: string
+          description: >
+            Empty when the model was not sure of the accepted binomial, which
+            is preferred to an invented one.
+        whyItMatches:
+          type: string
+          description: Why this candidate fits THIS visitor, anchored to what they said or chose — never a sentence that would read the same for everyone.
+        botanicalDetail: { type: string }
+        matureSize:
+          type: string
+          description: Typical mature height, or the literal text "not sure".
+        growingRequirements:
+          type: array
+          items: { type: string }
+          description: Two to six short items. The key is omitted when the model had nothing worth saying.
+        limitations:
+          type: array
+          items: { type: string }
+          description: Up to six short warnings. The key is omitted when there is nothing worth warning about.
+        culturalSignificance: { $ref: '#/components/schemas/DiscoveryClaim' }
+        ecologicalFit: { $ref: '#/components/schemas/DiscoveryClaim' }
+        identity: { $ref: '#/components/schemas/DiscoveryIdentity' }
+        confidence: { $ref: '#/components/schemas/DiscoveryConfidence' }
+        sourceIds: { type: array, items: { type: string }, description: Every source this candidate drew on — for the citation list. An id that was not retrieved is dropped rather than passed on. }
+    DiscoveryClaim:
+      type: object
+      description: One statement about a candidate with the evidence behind it.
+      required: [text, evidence]
+      properties:
+        text: { type: string }
+        evidence:
+          type: string
+          enum: [sourced, uncertain, interpretation, user_defined, none]
+          description: >
+            What the claim's support actually is, not how confident the model
+            feels. "sourced" — every factual part is backed by a named source.
+            "uncertain" — the sources disagree, only partly support it or are
+            thin. "interpretation" — a cultural reading rather than a
+            documented fact, even beside a citation. "user_defined" — the
+            meaning came from the visitor and is never upgraded to a fact.
+            "none" — no reliable evidence was found. A claim that says
+            "sourced" but whose citations were all rejected is downgraded to
+            "uncertain" by the server.
+        sourceIds:
+          type: array
+          items: { type: string }
+          description: Ids of the retrieved sources that support the claim. Only ids the server actually retrieved survive validation.
+    DiscoveryIdentity:
+      type: object
+      description: Filled in by the server after the reply is read, from the taxonomic lookup. Never written by the model.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [confirmed, not_found, unverified, not_attempted]
+          description: >
+            "confirmed" — a taxonomic record accepts this binomial.
+            "not_found" — no record of the name was found. "unverified" —
+            the lookup failed, which is not the same as the name being
+            wrong. "not_attempted" — there was no binomial to check or no
+            verifier was configured, so nothing reads as verified.
+        acceptedName:
+          type: string
+          description: The name the taxonomic record accepts; omitted when none was found.
+        family:
+          type: string
+          description: The accepted family; omitted when none was found.
+        source:
+          type: string
+          description: The taxonomic record's own URL; omitted when nothing was found.
+    DiscoveryConfidence:
+      type: object
+      description: A candidate's overall assessment, with the meaning of the level attached so the level is never read as a measurement.
+      required: [level, definition, assessedBy]
+      properties:
+        level: { type: string, enum: [high, moderate, low, insufficient] }
+        definition:
+          type: string
+          description: The published meaning of the level, filled in by the server so wording cannot drift between requests.
+        assessedBy: { type: string, example: 'language model, from the retrieved sources. Not an independently measured score.' }
+    ResearchSource:
+      type: object
+      description: One retrieved finding, carrying the server-assigned id the candidates cite and the address a visitor follows.
+      required: [id, title, url, kind, retrievedAt]
+      properties:
+        id: { type: string, example: s1 }
+        title: { type: string }
+        url: { type: string, description: The address the visitor follows. Never a url that embeds the query or a credential. }
+        publisher: { type: string }
+        kind: { type: string, enum: [web_page, encyclopedia, biodiversity_record, scholarly] }
+        snippet: { type: string }
+        retrievedAt: { type: string, format: date-time }
+    SessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        handle:
+          type: string
+          maxLength: 60
+          description: >
+            An optional opaque label the visitor chose. It is not an identity
+            and is never used to authorise anything; Everroot asks for no
+            email, no name and no date of birth anywhere in this flow.
+    SessionResponse:
+      type: object
+      required: [token, expiresAt, anonymous]
+      properties:
+        token:
+          type: string
+          description: Returned exactly once and not recoverable afterwards — only its hash is stored.
+        expiresAt: { type: string, description: When the client should obtain a new token. Empty when the expiry could not be read back after issuance. }
+        anonymous:
+          type: boolean
+          const: true
+          description: This is an ordinary visitor session. Account sign-in would be an addition to this, never a requirement.
+    SavedDiscoverySummary:
+      type: object
+      description: One saved discovery as the list renders it.
+      required: [id, intention, researchStatus, status, createdAt, sourceCount]
+      properties:
+        id: { type: string, maxLength: 64, description: The runId this discovery answers to. }
+        intention: { type: string }
+        researchStatus: { type: string, enum: [researched, partial, unavailable] }
+        status: { type: string, enum: [complete, failed] }
+        createdAt: { type: string, format: date-time }
+        sourceCount:
+          type: integer
+          minimum: 0
+          description: How many findings the result carried, so a list can show a researched answer apart from a provisional one without loading every source.
+    SavedDiscovery:
+      type: object
+      description: One saved discovery with its result and sources. Ownership is enforced on every read — a run the caller does not own is a 404.
+      required: [id, intention, researchStatus, status, createdAt, sourceCount, payload, sources]
+      properties:
+        id: { type: string, maxLength: 64 }
+        intention: { type: string }
+        researchStatus: { type: string, enum: [researched, partial, unavailable] }
+        status: { type: string, enum: [complete, failed] }
+        createdAt: { type: string, format: date-time }
+        sourceCount: { type: integer, minimum: 0 }
+        description:
+          type: string
+          description: The visitor's own words, kept so they can read them again. Omitted when empty.
+        tradition: { type: string }
+        region: { type: string }
+        nakshatra: { type: string }
+        followUpQuestion: { type: string, description: Omitted when absent. }
+        disclaimer: { type: string }
+        promptVersion: { type: string }
+        model: { type: string }
+        payload:
+          type: object
+          description: The stored discovery result, verbatim — candidates, research status, unverified areas, prompt version, model and disclaimer.
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/SavedDiscoverySource' }
+          description: The findings saved with this run. Research retrieved for one visitor is never written to a shared global table.
+    SavedDiscoverySource:
+      type: object
+      description: One finding saved with its discovery. The field names are the stored record's own, returned as stored.
+      required: [SourceID, Title, URL, Publisher, Kind, Snippet, RetrievedAt]
+      properties:
+        SourceID: { type: string, example: s1 }
+        Title: { type: string }
+        URL: { type: string }
+        Publisher: { type: string }
+        Kind: { type: string, example: web_page }
+        Snippet: { type: string }
+        RetrievedAt: { type: string, format: date-time }
+    QuestionRequest:
+      type: object
+      additionalProperties: false
+      required: [question]
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: >
+            The visitor's own question, trimmed before the emptiness check —
+            blank or whitespace-only is a 400.
+        sessionId:
+          type: string
+          description: >
+            Optional. Groups the persisted interaction with the visitor's
+            session. It is never sent to the model and never affects whether
+            an answer is produced.
+        intention:
+          type: string
+          maxLength: 100
+          description: Optional. A short label for what the visitor is after, written into the prompt as context.
+        context:
+          type: object
+          additionalProperties: { type: string }
+          description: Optional. Free-form string pairs written into the prompt as context. Blank values are skipped.
+    QuestionResponse:
+      type: object
+      required: [status, interactionId, question, answer, promptVersion, model, disclaimer]
+      properties:
+        status: { type: string, const: ok }
+        interactionId:
+          type: string
+          format: uuid
+          description: >
+            The id of the persisted interaction when the database accepted
+            the write; a generated UUID when persistence was unavailable.
+        question: { type: string, description: The question as it was answered — trimmed. }
+        answer: { type: string, description: The model's answer. Machine-written and never stored as a reviewed record. }
+        promptVersion: { type: string }
+        model: { type: string }
+        disclaimer: { type: string, description: Present so an API consumer must invent no wording of its own for what the answer is. }
+    FeedbackRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        interactionId:
+          type: string
+          description: >
+            The answer this feedback is about. It is recorded only when
+            well-formed as a UUID; any other value is stored as null rather
+            than rejected.
+        feedbackType:
+          type: string
+          maxLength: 50
+          description: >
+            What the feedback is about. The interface sends "answer" or
+            "website" and a blank value defaults to "answer".
+        rating:
+          type: [integer, 'null']
+          description: Optional. Stored exactly as sent; the interface sends 1 for helpful and -1 for unhelpful.
+        comment:
+          type: string
+          maxLength: 2000
+        correction:
+          type: string
+          maxLength: 2000
+    ConversationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+          description: Continue an existing session. Omit it to start a new one.
+        message:
+          type: string
+          description: The visitor's turn in their own words. Free text with no limit beyond the request body cap.
+        intent:
+          type: string
+          description: >
+            The intent the visitor picked. The vocabulary the flow
+            understands is celebrate, remember, explore, grow and curious;
+            an unrecognised value is ignored by the state machine rather
+            than refused with a 400.
+    ConversationResponse:
+      type: object
+      required: [session_id, state, message]
+      properties:
+        session_id:
+          type: string
+          description: The session this turn belongs to. Present on the opening reply too, where it names the session just created.
+        state:
+          type: string
+          enum: [greeting, intent_selected, collecting_details, ready_for_discovery, discovery_complete, no_verified_mapping, no_suggestions, recommendation_unavailable]
+          description: >
+            Where the flow now stands. "no_verified_mapping" is retained only
+            so a client comparing state strings does not break; the AI-first
+            flow no longer produces it. "no_suggestions" is a successful call
+            in which the model declined to suggest anything, kept apart from
+            "recommendation_unavailable" — an honest failure — so a visitor
+            is never told the service broke when it merely had nothing to
+            offer.
+        intent:
+          type: string
+          enum: [celebrate, remember, explore, grow, curious]
+          description: Omitted until an intent has been chosen; once chosen it is one of the five the flow understands.
+        message:
+          type: string
+          description: The assistant's line for this turn, written from the flow's own rules and never presented as a reviewed claim.
+        suggestions:
+          type: array
+          items: { type: string }
+          description: The short clickable replies for this state. Unrelated to trees; omitted when there are none.
+        recommendations:
+          $ref: '#/components/schemas/ConversationRecommendations'
+    ConversationRecommendations:
+      type: object
+      description: >
+        Set once the model has answered. This is the only place tree
+        suggestions appear in the conversation flow, and the suggestion shape
+        is deliberately the same one POST /api/v1/recommendations returns, so
+        a result rendered from a conversation and one rendered from the form
+        are the same object. The session keeps no reviewed mapping id for it
+        — a model suggestion has none, and inventing one would be exactly the
+        claim this flow must not make.
+      required: [status, suggestions, evidence, promptVersion, model, disclaimer]
+      properties:
+        status: { type: string, enum: [ok, no_suggestions] }
+        suggestions: { type: array, items: { $ref: '#/components/schemas/Suggestion' } }
+        evidence: { $ref: '#/components/schemas/EvidenceStatus' }
+        promptVersion: { type: string }
+        model: { type: string }
+        disclaimer: { type: string }
+        followUpQuestion: { type: string, description: Omitted when absent. Present only when one missing fact would materially change the suggestions. }
+    ConversationSession:
+      type: object
+      description: A short-lived anonymous discovery session. It needs no user — only the id the flow issued — and it carries no reviewed mapping for a model-drawn suggestion, because inventing one would be the claim this flow must not make.
+      required: [id, state, expires_at]
+      properties:
+        id: { type: string }
+        intent:
+          type: string
+          enum: [celebrate, remember, explore, grow, curious]
+          description: Omitted until an intent has been chosen.
+        tradition_slug: { type: string, description: Omitted when no tradition was named. }
+        region_name: { type: string, description: Omitted when no region was named. }
+        nakshatra: { type: string, description: Omitted when no Nakshatra was named. }
+        state:
+          type: string
+          enum: [greeting, intent_selected, collecting_details, ready_for_discovery, discovery_complete, no_verified_mapping, no_suggestions, recommendation_unavailable]
+          description: The same vocabulary the conversation reply reports; "no_verified_mapping" is retained for older clients and is no longer produced.
+        discovery_mapping_id:
+          type: string
+          description: Omitted — a model suggestion has no reviewed mapping id, so the field stays empty rather than naming one.
+        discovery_revision_id:
+          type: string
+          description: Omitted — for the same reason as discovery_mapping_id.
+        expires_at: { type: string, format: date-time, description: After this instant the session no longer resolves and reads as 404. }

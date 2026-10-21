@@ -112,3 +112,37 @@ func TestFindMigrationFilesEmptyDir(t *testing.T) {
 		t.Fatal("expected error on empty migration directory, got nil")
 	}
 }
+
+func TestIsLegacyCatalogueMigration(t *testing.T) {
+	// The catalogue and the gate around it: skippable, because discovery no
+	// longer reads them.
+	legacyFiles := []string{
+		"0001_registry.sql",
+		"0002_nakshatra_reference.sql",
+		"0004_nakshatra_tradition_catalog.sql",
+		"0012_botanical_reference_catalogue.sql",
+	}
+	for _, f := range legacyFiles {
+		if !isLegacyCatalogueMigration(f) {
+			t.Errorf("expected %s to be classified as legacy catalogue migration", f)
+		}
+	}
+
+	// What a visitor writes. These must survive the default run, and getting
+	// this boundary wrong is not academic: 0013 makes user_feedback carry
+	// interaction_id, which POST /api/v1/feedback inserts into, and 0011 makes
+	// discovery_sessions, which the conversation routes read. Both were once
+	// filed under "legacy catalogue" and left a database that verified and then
+	// failed at runtime.
+	userDataFiles := []string{
+		"0011_conversation_sessions.sql",
+		"0013_user_interactions_and_feedback.sql",
+		"0014_discovery_user_data.sql",
+		"0015_user_preferences.sql",
+	}
+	for _, f := range userDataFiles {
+		if isLegacyCatalogueMigration(f) {
+			t.Errorf("expected %s to NOT be classified as legacy catalogue migration", f)
+		}
+	}
+}

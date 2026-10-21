@@ -142,31 +142,253 @@ func TestCORSPreflight(t *testing.T) {
 	}
 }
 
-// The reviewed catalogue describes records that were checked by a person, so if
-// the database holding them cannot be reached the endpoints must say so. Before
-// this, they answered 200 with a built-in list, which is indistinguishable from
-// a reviewed record and implies Everroot checked something it had not.
-func TestReviewedCatalogueIsUnavailableWithoutDatabase(t *testing.T) {
+// The 27 nakshatras, the traditions to attach them to and the regions those
+// traditions are recorded in are an input vocabulary: they name what a visitor
+// may choose from and assert nothing about any tree. They are served from
+// local reference data, so discovery works against a database that is empty,
+// unseeded or simply unreachable.
+func TestDiscoveryVocabularyNeedsNoDatabase(t *testing.T) {
 	t.Setenv("HF_TOKEN", "test-token")
 	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	for _, path := range []string{
-		"/api/v1/traditions",
-		"/api/v1/nakshatras",
-		"/api/v1/traditions/nakshatra-tree-association/regions",
-	} {
+	get := func(path string) (int, string) {
+		t.Helper()
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
-		if w.Code != http.StatusServiceUnavailable {
-			t.Fatalf("%s: expected 503 when no database is configured, got %d (%s)", path, w.Code, w.Body.String())
+		return w.Code, w.Body.String()
+	}
+
+	code, body := get("/api/v1/nakshatras")
+	if code != http.StatusOK {
+		t.Fatalf("/api/v1/nakshatras: got %d, want 200 with no database configured (%s)", code, body)
+	}
+	var nakshatras []struct {
+		Name    string `json:"name"`
+		Ordinal int    `json:"ordinal"`
+	}
+	if err := json.Unmarshal([]byte(body), &nakshatras); err != nil {
+		t.Fatalf("nakshatras is not JSON: %v (%s)", err, body)
+	}
+	if len(nakshatras) != 27 {
+		t.Fatalf("got %d nakshatras, want the canonical 27", len(nakshatras))
+	}
+	for i, n := range nakshatras {
+		if n.Ordinal != i+1 {
+			t.Errorf("ordinal %d sits at position %d; the ordering is part of the vocabulary", n.Ordinal, i)
 		}
-		body := w.Body.String()
-		if strings.Contains(body, "Ashwini") || strings.Contains(body, "Nakshatra Tree Association") {
-			t.Fatalf("%s: served built-in catalogue data instead of reporting unavailability: %s", path, body)
+		if n.Name == "" {
+			t.Errorf("nakshatra at ordinal %d has no name", n.Ordinal)
 		}
+	}
+	if nakshatras[0].Name != "Ashwini" || nakshatras[26].Name != "Revati" {
+		t.Errorf("vocabulary starts at %q and ends at %q, want Ashwini..Revati",
+			nakshatras[0].Name, nakshatras[26].Name)
+	}
+
+	code, body = get("/api/v1/traditions")
+	if code != http.StatusOK {
+		t.Fatalf("/api/v1/traditions: got %d, want 200 with no database configured (%s)", code, body)
+	}
+	var traditions []struct {
+		Slug string `json:"slug"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(body), &traditions); err != nil {
+		t.Fatalf("traditions is not JSON: %v (%s)", err, body)
+	}
+	if len(traditions) == 0 {
+		t.Fatal("no traditions offered with no database configured")
+	}
+	found := false
+	for _, tr := range traditions {
+		if tr.Slug == "nakshatra-tree-association" && tr.Name != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the nakshatra tradition is missing from %s", body)
+	}
+
+	code, body = get("/api/v1/traditions/nakshatra-tree-association/regions")
+	if code != http.StatusOK {
+		t.Fatalf("regions: got %d, want 200 with no database configured (%s)", code, body)
+	}
+	var regions []string
+	if err := json.Unmarshal([]byte(body), &regions); err != nil {
+		t.Fatalf("regions is not JSON: %v (%s)", err, body)
+	}
+	if len(regions) == 0 {
+		t.Errorf("no regions offered for a supported tradition: %s", body)
+	}
+
+	// An unrecognised tradition must not become a wall. The region field only
+	// ever narrows a query, so finding nothing is an empty list, not an error.
+	code, body = get("/api/v1/traditions/not-a-tradition/regions")
+	if code != http.StatusOK {
+		t.Fatalf("unknown tradition: got %d, want 200 with an empty list (%s)", code, body)
+	}
+	var unknown []string
+	if err := json.Unmarshal([]byte(body), &unknown); err != nil {
+		t.Fatalf("regions is not JSON: %v (%s)", err, body)
+	}
+	if unknown == nil {
+		t.Fatal("an empty region list must marshal as [], not as null")
+	}
+	if len(unknown) != 0 {
+		t.Errorf("unknown tradition returned regions %v, want none", unknown)
+	}
+}
+
+// The naming systems and the names they serve are vocabulary, like the
+// nakshatra list itself: they name what a visitor may choose from and assert
+// nothing about any tree. Asking which language a visitor knows a nakshatra by
+// must not need PostgreSQL either, or the cultural step would be the one part
+// of discovery that still depended on a migration having run.
+func TestNamingSystemVocabularyNeedsNoDatabase(t *testing.T) {
+	t.Setenv("HF_TOKEN", "test-token")
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	get := func(path string) (int, string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		return w.Code, w.Body.String()
+	}
+
+	code, body := get("/api/v1/naming-systems")
+	if code != http.StatusOK {
+		t.Fatalf("/api/v1/naming-systems: got %d, want 200 with no database configured (%s)", code, body)
+	}
+	var systems []struct {
+		Code    string `json:"code"`
+		Name    string `json:"name"`
+		Endonym string `json:"endonym"`
+	}
+	if err := json.Unmarshal([]byte(body), &systems); err != nil {
+		t.Fatalf("naming systems is not JSON: %v (%s)", err, body)
+	}
+	offered := map[string]bool{}
+	for _, system := range systems {
+		offered[system.Code] = true
+	}
+	// Tamil has to be on offer, not merely reachable: a naming system a visitor
+	// cannot select is the same as one Everroot does not hold.
+	if !offered["ta"] {
+		t.Errorf("Tamil is not offered to a visitor: %s", body)
+	}
+	if !offered["canonical"] {
+		t.Errorf("the romanised default is not offered: %s", body)
+	}
+
+	code, body = get("/api/v1/nakshatras/ta")
+	if code != http.StatusOK {
+		t.Fatalf("/api/v1/nakshatras/ta: got %d, want 200 with no database configured (%s)", code, body)
+	}
+	var tamil []struct {
+		Name      string `json:"name"`
+		Ordinal   int    `json:"ordinal"`
+		Canonical string `json:"canonical"`
+	}
+	if err := json.Unmarshal([]byte(body), &tamil); err != nil {
+		t.Fatalf("Tamil nakshatras is not JSON: %v (%s)", err, body)
+	}
+	if len(tamil) != 27 {
+		t.Fatalf("got %d Tamil names, want the canonical 27", len(tamil))
+	}
+	for i, entry := range tamil {
+		if entry.Ordinal != i+1 {
+			t.Errorf("ordinal %d sits at position %d", entry.Ordinal, i)
+		}
+		if entry.Canonical == "" {
+			t.Errorf("ordinal %d carries no canonical name to send on", entry.Ordinal)
+		}
+		if !containsTamilScript(entry.Name) {
+			t.Errorf("ordinal %d: %q is not Tamil script", entry.Ordinal, entry.Name)
+		}
+	}
+
+	// The unqualified list keeps the contract it always had, and its spelling is
+	// unchanged by any of this: asking for the canonical naming system by name
+	// must produce the very same twenty-seven in the very same order.
+	code, plain := get("/api/v1/nakshatras")
+	if code != http.StatusOK {
+		t.Fatalf("/api/v1/nakshatras: got %d, want 200 (%s)", code, plain)
+	}
+	var canonicalList []struct {
+		Name    string `json:"name"`
+		Ordinal int    `json:"ordinal"`
+	}
+	if err := json.Unmarshal([]byte(plain), &canonicalList); err != nil {
+		t.Fatalf("nakshatras is not JSON: %v", err)
+	}
+	if len(canonicalList) != 27 {
+		t.Fatalf("unqualified list returned %d names, want 27", len(canonicalList))
+	}
+	if canonicalList[0].Name != "Ashwini" || canonicalList[26].Name != "Revati" {
+		t.Errorf("unqualified list is %q..%q, want Ashwini..Revati",
+			canonicalList[0].Name, canonicalList[26].Name)
+	}
+	if _, supported := nakshatraNamesFor(canonicalNamingCode); !supported {
+		t.Error("the romanised default is not a recognised naming system")
+	}
+
+	// A naming system Everroot does not hold is still twenty-seven names, not a
+	// wall: the sequence is the same however it is spelled.
+	code, body = get("/api/v1/nakshatras/gr")
+	if code != http.StatusOK {
+		t.Fatalf("unknown naming system: got %d, want 200 with the canonical list (%s)", code, body)
+	}
+	var fallback []struct{}
+	if err := json.Unmarshal([]byte(body), &fallback); err != nil {
+		t.Fatalf("is not JSON: %v", err)
+	}
+	if len(fallback) != 27 {
+		t.Errorf("unknown naming system returned %d names, want 27", len(fallback))
+	}
+}
+
+// The reference vocabulary and the reviewed records are different things, and
+// only the latter may be answered from the database. A built-in list would be
+// indistinguishable from a reviewed record and would imply Everroot had
+// checked something it had not, so an endpoint that reads reviewed records
+// still reports an unreachable database rather than guessing.
+func TestReviewedRecordsStillRequireTheDatabase(t *testing.T) {
+	t.Setenv("HF_TOKEN", "test-token")
+	h, err := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-revision")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/trees", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/api/v1/trees: got %d, want 503 without a database (%s)", w.Code, w.Body.String())
+	}
+
+	// Discovery is the other reviewed endpoint. It must not invent a mapping,
+	// and it must not fail either: with no database there is simply nothing
+	// reviewed to report.
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/discoveries",
+		strings.NewReader(`{"tradition":"nakshatra-tree-association","nakshatra":"Ashwini"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("/api/v1/discoveries: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("discoveries is not JSON: %v", err)
+	}
+	if result["status"] != "no_verified_mapping" {
+		t.Errorf("status = %v, want no_verified_mapping", result["status"])
+	}
+	if recs, ok := result["recommendations"].([]any); !ok || len(recs) != 0 {
+		t.Errorf("recommendations = %v, want an empty list rather than an invented one", result["recommendations"])
 	}
 }
 
@@ -191,7 +413,7 @@ func TestCatalogueFailureLogsAreCredentialFree(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/nakshatras", nil))
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/trees", nil))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 with an unreachable database, got %d (%s)", w.Code, w.Body.String())
 	}

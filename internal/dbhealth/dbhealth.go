@@ -358,7 +358,7 @@ func Probe(ctx context.Context, dsn string, connectTimeout time.Duration) Report
 			Diag: Diagnosis{
 				Category:    CategoryNotConfigured,
 				Retryable:   false,
-				Remediation: "DATABASE_URL is not set. Add it to the backend project; the reviewed catalogue cannot be served without it.",
+				Remediation: "DATABASE_URL is not set. Add it to the backend project if user-data persistence is needed; discovery works without it.",
 			},
 		}
 	}
@@ -410,7 +410,7 @@ func Probe(ctx context.Context, dsn string, connectTimeout time.Duration) Report
 	report := Report{Target: target, Reachable: true, Latency: time.Since(started)}
 
 	var schemaPresent bool
-	if err := conn.QueryRow(ctx, `SELECT to_regclass('public.nakshatras') IS NOT NULL`).Scan(&schemaPresent); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT to_regclass('public.discovery_runs') IS NOT NULL`).Scan(&schemaPresent); err != nil {
 		report.Diag = Classify(err)
 		return report
 	}
@@ -419,7 +419,7 @@ func Probe(ctx context.Context, dsn string, connectTimeout time.Duration) Report
 		report.Diag = Diagnosis{
 			Category:    CategorySchemaMissing,
 			Retryable:   false,
-			Remediation: "The database is reachable and authentication works, but the required tables are missing. Apply the migrations with `DIRECT_URL='…' go run ./cmd/migrate`.",
+			Remediation: "The database is reachable and authentication works, but user-data tables are missing. Apply the migrations with `DIRECT_URL='…' go run ./cmd/migrate`.",
 		}
 		return report
 	}

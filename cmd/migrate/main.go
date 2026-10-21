@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -63,6 +62,36 @@ func resolveMigrationDir(preferred string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("migrations directory not found; tried %v (run from repository root or set MIGRATIONS_DIR)", candidates)
+}
+
+// isLegacyCatalogueMigration reports whether a migration builds the reviewed
+// catalogue or the publication machinery around it — the knowledge tables that
+// the AI-first architecture deliberately does not keep in the database.
+//
+// The boundary matters, and it is not "0001 through 0013". Two of those files
+// are user data and must still be applied: 0011 creates discovery_sessions,
+// the conversational session the API reads and writes on every request, and
+// 0013 creates user_interactions and user_feedback, the latter carrying the
+// interaction_id column that POST /api/v1/feedback inserts into. Skipping them
+// left a database that passes schema verification and still fails at runtime:
+// feedback answered 503 on `column "interaction_id" of relation "user_feedback"
+// does not exist`, because 0014 creates a standalone user_feedback without that
+// column and only adds run_id/user_id to the one 0013 already made.
+//
+// So: the catalogue and its gate are skippable; the things a visitor writes are
+// not. 0001-0010 and 0012 are skipped by default and can be included with
+// APPLY_LEGACY_CATALOGUE_MIGRATIONS=true for a deployment that still wants the
+// reviewed-evidence lookup served from real rows.
+func isLegacyCatalogueMigration(filename string) bool {
+	for _, prefix := range []string{
+		"0001_", "0002_", "0003_", "0004_", "0005_", "0006_",
+		"0007_", "0008_", "0009_", "0010_", "0012_",
+	} {
+		if strings.HasPrefix(filename, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // findMigrationFiles returns all .sql files in dir sorted in ascending alphabetical order.
@@ -126,22 +155,51 @@ func executeMigrationTx(ctx context.Context, conn *pgx.Conn, version string, sql
 	return nil
 }
 
-// verifySchema checks that the essential reference tables exist and contain required baseline records.
-func verifySchema(ctx context.Context, conn *pgx.Conn) (int, int, error) {
-	var nakshatraCount, authorityCount int
-	if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM nakshatras").Scan(&nakshatraCount); err != nil {
-		return 0, 0, fmt.Errorf("query nakshatras table: %w", err)
+// verifySchema checks that the tables the application actually needs exist.
+//
+// It used to require the reviewed-catalogue tables (nakshatras,
+// tree_species_authority) to be present AND seeded, which made a catalogue a
+// precondition for migrating at all. That was true when recommendations were
+// drawn from the catalogue. They are not any more: discovery is generated
+// dynamically from retrieved sources, and the catalogue is consulted only by
+// the reviewed-evidence lookup. A deployment that wants none of that should be
+// able to migrate a clean database, so the check below is about user data and
+// reports the catalogue as informational rather than as a gate.
+func verifySchema(ctx context.Context, conn *pgx.Conn) (userData int, catalogue int, err error) {
+	// Tables without which the application cannot save or read a discovery.
+	required := []string{
+		"users",
+		"auth_tokens",
+		"discovery_runs",
+		"discovery_messages",
+		"discovery_results",
+		"discovery_sources",
 	}
-	if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM tree_species_authority").Scan(&authorityCount); err != nil {
-		return 0, 0, fmt.Errorf("query tree_species_authority table: %w", err)
+	for _, table := range required {
+		var present bool
+		if err := conn.QueryRow(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", table).Scan(&present); err != nil {
+			return 0, 0, fmt.Errorf("check table %s: %w", table, err)
+		}
+		if !present {
+			return 0, 0, fmt.Errorf("required user-data table %q is missing after migration", table)
+		}
+		userData++
 	}
-	if nakshatraCount == 0 {
-		return 0, 0, errors.New("nakshatras table has 0 rows; expected authoritative reference records")
+
+	// The reviewed catalogue is optional. Its presence is reported so a
+	// deployment can see what it has, and its absence is not an error.
+	for _, table := range []string{"nakshatras", "tree_species_authority"} {
+		var present bool
+		if err := conn.QueryRow(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", table).Scan(&present); err != nil {
+			return 0, 0, fmt.Errorf("check table %s: %w", table, err)
+		}
+		if present {
+			catalogue++
+		}
 	}
-	if authorityCount == 0 {
-		return 0, 0, errors.New("tree_species_authority table has 0 rows; expected botanical reference records")
-	}
-	return nakshatraCount, authorityCount, nil
+	return userData, catalogue, nil
 }
 
 func main() {
@@ -228,8 +286,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	includeLegacy := os.Getenv("APPLY_LEGACY_CATALOGUE_MIGRATIONS") == "true"
 	appliedCount := 0
 	for _, file := range files {
+		if !includeLegacy && isLegacyCatalogueMigration(file) {
+			logger.Info("Skipping legacy catalogue migration to keep database focused exclusively on user data", "file", file)
+			continue
+		}
 		version := strings.TrimSuffix(file, ".sql")
 
 		var exists bool
@@ -263,15 +326,16 @@ func main() {
 		logger.Info("Successfully applied migrations", "count", appliedCount)
 	}
 
-	// Verify required reference tables
-	nakshatraCount, authorityCount, err := verifySchema(ctx, conn)
+	// Verify the schema the application actually depends on. The reviewed
+	// catalogue is reported but is no longer a precondition for migrating.
+	userTables, catalogueTables, err := verifySchema(ctx, conn)
 	if err != nil {
 		logger.Error("Schema verification failed after migrations", "error", err)
 		os.Exit(1)
 	}
 
 	logger.Info("Schema verified",
-		"nakshatras", nakshatraCount,
-		"tree_species_authority", authorityCount,
+		"user_data_tables", userTables,
+		"catalogue_tables_present", catalogueTables,
 	)
 }

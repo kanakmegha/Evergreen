@@ -35,7 +35,17 @@ import (
 // not entitled to carry. And rule 10 now separates repeating the visitor's
 // request from asserting a property of the tree, because the model had learned
 // to report the question honestly and then imply the answer anyway.
-const RecommendPromptVersion = "v1.3-visitor-anchored-reasons"
+// v1.4 makes an ambiguous selection a reason to ask rather than a licence to
+// guess. Nothing stopped the model from treating a broad region or an
+// unnamed regional form as though it were the only one — choosing a single
+// reading and writing with its confidence, which is how one tradition ends up
+// described as a single universal practice. Rule 6 now names that case: a
+// region spanning several climates, or a tradition whose regional form the
+// visitor did not give, is a fact it is missing, so it asks which rather than
+// assuming one. This narrows nothing that rule 5 already required and widens
+// nothing about culture: rules 7, 9 and 10 are untouched, and a question still
+// never stands in for an answer.
+const RecommendPromptVersion = "v1.4-visitor-anchored-reasons"
 
 // AssociationStatusUnverified is the single publication-gate verdict the model
 // is ever told about. It is the case your visitor asked a cultural question and
@@ -184,7 +194,7 @@ What to do:
 3. "whyItMatches" must be about THIS visitor and nobody else. Name what they told you or chose, and connect it to something specific about the tree — its mature size against their space, its climate against their region, its character against their purpose. A sentence that would read the same for every visitor is not a reason; keep rewriting it until it could only have been written for them. When they told you nothing personal, anchor it to the reason they came for (remembering someone, a gift for the future, plain curiosity) and to the practical facts they did give.
 4. "botanicalDetail" is one or two sentences of general botany: family, habit, where it is native.
 5. Give what reliable general botany and horticulture supports: typical mature height in "matureSize" (for example "8-12 m"), care needs in "growingRequirements", honest drawbacks in "limitations". Where a fact is not reliable, write "not sure" in that field instead of guessing.
-6. Set "followUpQuestion" to one short question, asked because a missing fact would change what you recommend. Ask it whenever the visitor has told you nothing about themselves or their situation — an empty "answer" beside only an intention is exactly that case — and whenever some fact you would want is absent. Omit the key only when you already have everything that matters. A question never stands in for an answer: always give your best suggestions now.
+6. Set "followUpQuestion" to one short question, asked because a missing fact would change what you recommend. Ask it whenever the visitor has told you nothing about themselves or their situation — an empty "answer" beside only an intention is exactly that case — and whenever some fact you would want is absent. Ask it too when what they gave is too broad to use honestly: a region spanning several climates, or a tradition whose regional form they did not name. One tradition is never a single universal practice, and you have not been told which of its variants they mean — ask which, rather than assume one and write as though it were the only one. Omit the key only when you already have everything that matters. A question never stands in for an answer: always give your best suggestions now.
 7. When "associationStatus" is present, set "culturalNote" on each suggestion to one plain sentence saying that Everroot has no reviewed record for that tradition and Nakshatra. It describes the record, not the tree: no tree is or is not associated with a nakshatra because of it. "culturalNote" is the ONLY place you may mention culture at all. Omit it when "associationStatus" is absent, and then say nothing about cultural associations anywhere — not even to deny one for a specific tree.
 
 Hard rules:

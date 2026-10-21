@@ -30,9 +30,17 @@ const VIEWPORTS = [
   { name: 'small', width: 320, height: 700 },
 ];
 
-// The single no-match notice. It reframes the absence as a deliberate choice
-// ("rather than guess") rather than a failed lookup, and must appear once.
-const NO_MATCH_NOTICE = /Rather than guess[\s\S]*not Nakshatra recommendations/;
+// What the page says about itself when there is no reviewed match: a plain
+// description of what the shortlist actually is, never a warning about which
+// cultural answers were given or skipped. There are two honest shapes it can
+// take — the model answered, or the botanical reference filled in — because
+// which one you get depends on which service answered, not on the visitor.
+// It used to read "your answers are outside Everroot's reviewed cultural
+// dataset", blaming a visitor's choices for an outcome nothing to do with them.
+const NO_MATCH_NOTICE =
+  /suggested from your answers|from the botanical reference that fits? your answers/;
+/** The framing that is gone, asserted absent on its own so a rewrite cannot slip past. */
+const DATASET_FRAMING = /reviewed cultural dataset|no cultural record to check|Rather than guess/;
 
 let passed = 0;
 const failures = [];
@@ -267,9 +275,10 @@ for (const vp of VIEWPORTS) {
     const body = await page.locator('body').innerText();
     assert.equal(
       body.split('not Nakshatra recommendations').length - 1,
-      1,
-      'the no-match explanation must appear exactly once'
+      0,
+      'the removed dataset-framing copy must not come back'
     );
+    assert.doesNotMatch(body, DATASET_FRAMING, 'an ordinary no-match is not a dataset failure');
     assert.match(await text(page, '.summary__lede'), NO_MATCH_NOTICE);
     // The old page repeated the same warning as a heading, an association line
     // and a per-tree caveat. None of those should exist any more.
@@ -545,6 +554,14 @@ async function edgeState(name, { setup, check }) {
       disclaimer: 'Stubbed for this check.',
     })
   );
+  // The results page asks for a research pass FIRST and only falls back to
+  // suggestions when that fails. Left unanswered, a live API answers it with
+  // whatever it finds at this moment and takes the page over from the fixture
+  // above — the exact accident the recommendations default exists to prevent.
+  // Failing it here keeps every state below on the path it was written to
+  // test; a state that wants the research pass overrides this, registered
+  // before setup for the same reason.
+  await page.route('**/api/v1/discovery', (route) => route.abort('failed'));
   await setup(page);
   await seedRecord(page);
   await step(`edge: ${name}`, async () => {
@@ -587,7 +604,10 @@ await edgeState('provider-error-keeps-the-shortlist', {
     // A provider failure must never be reported as missing cultural data.
     const body = await page.locator('body').innerText();
     assert.doesNotMatch(note, /no reviewed record for this combination|no record for this selection/);
-    assert.equal(body.split('not Nakshatra recommendations').length - 1, 1);
+    // A provider failure is reported as a provider failure, and the framing
+    // that used to blame the visitor's cultural answers is gone with it.
+    assert.equal(body.split('not Nakshatra recommendations').length - 1, 0);
+    assert.doesNotMatch(body, DATASET_FRAMING);
   },
 });
 
@@ -809,7 +829,11 @@ await edgeState('suggestions-provider-failure-is-shown', {
     // by one, and nothing is presented as verified either.
     assert.doesNotMatch(body, /AI-generated suggestion/);
     assert.doesNotMatch(body, /Verified against a reviewed source/);
-    assert.match(body, /Botanical records only|not Nakshatra recommendations/);
+    // Nothing was written by a model here, so the page describes the shortlist
+    // as the botanical reference rather than dressing the failure up as a
+    // cultural verdict on the visitor.
+    assert.match(body, NO_MATCH_NOTICE);
+    assert.doesNotMatch(body, DATASET_FRAMING);
   },
 });
 
@@ -918,6 +942,136 @@ await edgeState('the-bird-lands-on-the-chosen-tree', {
   },
 });
 
+/* --------------------------------------------- the research provenance */
+
+/**
+ * What a researched answer shows about itself: where each claim came from,
+ * which ones a source backs, and which ones nobody has settled.
+ *
+ * The fixture is deliberately mixed — one claim that is genuinely sourced, one
+ * that is explicitly uncertain, one confirmed botanical identity — because a
+ * panel that only ever renders the confident case would look identical whether
+ * or not the answer had actually been researched.
+ */
+const DISCOVERY_FIXTURE = {
+  status: 'ok',
+  candidates: [
+    {
+      name: 'Neem',
+      scientificName: 'Azadirachta indica',
+      whyItMatches: 'You asked for something tolerant of a dry, hot courtyard.',
+      botanicalDetail: 'A tree in the family Meliaceae.',
+      matureSize: '15-20 m',
+      growingRequirements: ['full sun'],
+      limitations: ['roots lift paving if planted too close'],
+      culturalSignificance: {
+        text: 'Used in traditional practice across the subcontinent.',
+        evidence: 'sourced',
+        sourceIds: ['s1'],
+      },
+      ecologicalFit: {
+        text: 'Whether it suits your region was not settled by what was retrieved.',
+        evidence: 'uncertain',
+        sourceIds: [],
+      },
+      identity: {
+        status: 'confirmed',
+        acceptedName: 'Azadirachta indica',
+        family: 'Meliaceae',
+        source: 'https://www.gbif.org/species/1',
+      },
+      confidence: {
+        level: 'moderate',
+        definition: 'A small number of agreeing sources.',
+        assessedBy: 'language model',
+      },
+      sourceIds: ['s1'],
+    },
+  ],
+  sources: [
+    {
+      id: 's1',
+      title: 'Neem',
+      url: 'https://en.wikipedia.org/wiki/Neem',
+      publisher: 'Wikipedia',
+      kind: 'encyclopedia',
+      snippet: 'A tree in the mahogany family.',
+      retrievedAt: '2026-01-04T10:00:00Z',
+    },
+  ],
+  researchStatus: 'researched',
+  researchSummary: 'Researched against 1 source(s) retrieved for this request.',
+  confidenceDefinitions: { moderate: 'A small number of agreeing sources.' },
+  promptVersion: 'v1.0-research-grounded',
+  model: 'stub-model',
+  disclaimer: 'Candidates are written by a language model.',
+  saved: false,
+};
+
+await edgeState('researched-answer-shows-its-sources', {
+  setup: async (page) => {
+    await page.route('**/api/v1/discovery', (route) => json(route, DISCOVERY_FIXTURE));
+  },
+  check: async (page) => {
+    // The provenance panel exists and is titled as what it is.
+    const panel = page.locator('section[aria-labelledby="provenance-title"]');
+    await panel.waitFor({ state: 'visible', timeout: 30000 });
+    assert.equal(await text(page, '#provenance-title'), 'What this answer rests on');
+
+    // The source that was actually retrieved is named, with its real address —
+    // the URL comes from the server's record of what it fetched, not from
+    // anything the model wrote.
+    const sourceLink = panel.locator('a[href="https://en.wikipedia.org/wiki/Neem"]');
+    assert.equal(await sourceLink.count(), 1, 'the retrieved source must be linked');
+    assert.match(await panel.innerText(), /Sources consulted \(1\)/);
+
+    // Both halves of the mixed fixture are reported as themselves: the sourced
+    // claim reads as backed, and the unsettled one does not borrow that
+    // confidence.
+    const claims = await panel.innerText();
+    assert.match(claims, /cultural claim backed by a source/);
+    assert.match(claims, /regional fit not evidenced/);
+    assert.match(claims, /botanical name confirmed/);
+
+    // The confidence read is labelled as the model's read, not as a
+    // measurement of evidence quality.
+    assert.match(claims, /not a measured score of evidence quality/i);
+
+    // And the tree the panel describes is the tree on the card.
+    assert.match(await page.locator('.shortlist__list .opt').first().innerText(), /Neem/);
+  },
+});
+
+await edgeState('research-outage-is-labelled-not-omitted', {
+  setup: async (page) => {
+    await page.route('**/api/v1/discovery', (route) =>
+      json(route, {
+        ...DISCOVERY_FIXTURE,
+        researchStatus: 'unavailable',
+        researchSummary: 'Not researched: no research backend was available for this request.',
+        sources: [],
+      })
+    );
+  },
+  check: async (page) => {
+    const panel = page.locator('section[aria-labelledby="provenance-title"]');
+    await panel.waitFor({ state: 'visible', timeout: 30000 });
+
+    // The answer is still shown, and it says plainly that nothing was looked
+    // up. This is the state that must never quietly become "researched".
+    const body = await page.locator('body').innerText();
+    assert.match(body, /Nothing was researched for this answer/i);
+    assert.match(body, /Not researched: no research backend was available/);
+    assert.ok(
+      (await page.locator('.shortlist__list .opt').count()) >= 1,
+      'a research outage must not empty the shortlist'
+    );
+
+    // With no sources retrieved, the panel must not link any.
+    assert.equal(await panel.locator('a[href^="http"]').count(), 0);
+  },
+});
+
 /**
  * The catalogue the discovery flow loads at the tradition step. In production
  * these three calls were landing on the web app itself and returning HTML 404s,
@@ -937,6 +1091,11 @@ async function discoveryCatalogue(state, routes) {
   const page = await context.newPage();
   page.on('pageerror', (error) => consoleErrors.push(`[discovery:${state}] ${error.message}`));
   const calls = [];
+  // Same guard as the edge states: the results page tries a research pass
+  // before suggestions, and a live answer to it would replace the fixture the
+  // state below is built on. Callers may override by registering their own
+  // route for this path inside `routes`.
+  await page.route('**/api/v1/discovery', (route) => route.abort('failed'));
   await routes(page, calls);
   await openTraditionStep(page);
   return { context, page, calls };
@@ -1074,29 +1233,52 @@ await (async () => {
   await page.route('**/api/v1/traditions', (route) => json(route, CATALOGUE_503_BODY, 503));
   await page.route('**/api/v1/nakshatras', (route) => json(route, CATALOGUE_503_BODY, 503));
   await page.route('**/api/v1/recommendations', (route) => json(route, SUGGESTIONS_FIXTURE));
+  // This state builds its own context instead of going through the helpers, so
+  // it needs the same guard: a live research pass would answer with its own
+  // shortlist and the fixture's two cards would become three.
+  await page.route('**/api/v1/discovery', (route) => route.abort('failed'));
 
-  await step(`${state}: step three warns and still moves forward`, async () => {
+  await step(`${state}: the cultural step warns and still moves forward`, async () => {
     await page.goto(`${BASE}/discover?intent=culture`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('.step__actions-end button', { timeout: 30000 });
     await page.locator('.step__actions-end button').last().click();
 
-    // Step two asks which kind of tradition, and one of them leads to step three.
+    // Step two asks which kind of tradition. Choosing one leads on to the
+    // cultural-context step, which asks whose naming system the names should
+    // be in — and only then to the nakshatra list itself.
     const choice = page.locator('.choice', { hasText: 'Nakshatra or astrological traditions' });
     await choice.waitFor({ state: 'visible', timeout: 20000 });
     await choice.click();
     await page.locator('.step__actions-end button').last().click();
 
     await page.waitForSelector('.step__count', { timeout: 20000 });
-    assert.match(await text(page, '.step__count'), /step 3 of 3/i);
+    assert.match(await text(page, '.step__count'), /step 3 of 4/i);
 
-    const notice = page.locator('.notice--warn');
+    const notice = page.locator('.notice--warn').first();
     await notice.waitFor({ state: 'visible', timeout: 20000 });
     assert.match(await notice.innerText(), /503/);
+    assert.match(
+      await notice.innerText(),
+      /continue without choosing a tradition/i,
+      'an unavailable list of traditions is reported as a list that is unavailable'
+    );
 
-    const next = page.locator('.step__actions-end button').last();
-    assert.equal(await next.isEnabled(), true, 'step three must stay navigable');
-    assert.match(await next.innerText(), /Skip and see everything on record/);
-    await next.click();
+    // An unavailable list must not gate the journey. The cultural step is
+    // optional, so it says what pressing the button will actually do and lets
+    // the visitor through it without an answer.
+    const cultural = page.locator('.step__actions-end button').last();
+    assert.equal(await cultural.isEnabled(), true, 'the cultural step must stay navigable');
+    assert.match(await cultural.innerText(), /Skip cultural context/);
+    await cultural.click();
+
+    // The names step that follows is optional too, and still warns about its
+    // own list rather than presenting an empty one.
+    await page.waitForSelector('.step__count', { timeout: 20000 });
+    assert.match(await text(page, '.step__count'), /step 4 of 4/i);
+    const names = page.locator('.step__actions-end button').last();
+    assert.equal(await names.isEnabled(), true, 'step four must stay navigable');
+    assert.match(await names.innerText(), /Skip and see everything on record/);
+    await names.click();
 
     await page.waitForURL(/\/results\//, { timeout: 30000 });
     await page.waitForSelector('.shortlist__list .opt', { timeout: 30000 });

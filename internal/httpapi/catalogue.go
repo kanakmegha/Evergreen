@@ -343,8 +343,13 @@ func (a *API) trees(w http.ResponseWriter, r *http.Request) {
 	// reported as unavailable rather than as an empty reference. "No records
 	// yet" and "we cannot reach the records" are different facts, and this
 	// project does not blur them.
+	//
+	// This is now the only endpoint that reads the reviewed catalogue, so it is
+	// also the one that reports a database failure by classification rather
+	// than by raw error: a driver error can embed the host and user from the
+	// DSN, and a log line is not the place for those.
 	if a.catalogue == nil {
-		writeError(w, 503, "botanical catalogue unavailable")
+		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
 		return
 	}
 	query := r.URL.Query().Get("q")
@@ -373,8 +378,7 @@ func (a *API) trees(w http.ResponseWriter, r *http.Request) {
 
 	facts, err := a.catalogue.List(r.Context(), query, limit, offset)
 	if err != nil {
-		a.log.Error("catalogue read failed", "request_id", r.Header.Get("X-Request-ID"), "error", err)
-		writeError(w, 503, "botanical catalogue unavailable")
+		a.reviewedCatalogueUnavailable(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{

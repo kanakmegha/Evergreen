@@ -16,6 +16,9 @@ import (
 	"everroot/internal/ai"
 	"everroot/internal/ai/conversation"
 	"everroot/internal/dbhealth"
+	"everroot/internal/discovery"
+	"everroot/internal/research"
+	"everroot/internal/store"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -34,6 +37,14 @@ type API struct {
 	catalogue   treeSource
 	explainer   explainer
 	recommender recommender
+	// pipeline runs the AI-first discovery. It is nil only when the AI client
+	// is unconfigured, and a nil pipeline makes /api/v1/discovery report that
+	// fact rather than answer with nothing.
+	pipeline *discovery.Pipeline
+	// store persists a visitor's own discoveries. A nil store means saving is
+	// unavailable, which is reported honestly and never costs a visitor the
+	// answer they already have.
+	store *store.Store
 	// revision is the build this process was made from. It is reported by
 	// /healthz so a deployment can be matched to a commit without trusting a
 	// dashboard, and it is never invented when it is unknown.
@@ -56,6 +67,7 @@ func New(db *pgxpool.Pool, log *slog.Logger, revision string) (http.Handler, err
 		mux:       http.NewServeMux(),
 		aiClient:  aiClient,
 		catalogue: cat,
+		store:     store.New(db, log),
 		revision:  revision,
 	}
 	// Only store the AI client in the interfaces when it really exists. Storing
@@ -73,6 +85,12 @@ func New(db *pgxpool.Pool, log *slog.Logger, revision string) (http.Handler, err
 		a.explainer = aiClient
 		a.recommender = aiClient
 		convRecommender = aiClient
+		a.pipeline = &discovery.Pipeline{
+			Suggester: aiClient,
+			Research:  newResearchProvider(log),
+			Verifier:  gbifVerifier{client: research.NewGBIF(log)},
+			Log:       log,
+		}
 	}
 	// The cultural gate is this handler: it owns the publication predicate, and
 	// injecting it here is what lets the conversation annotate a reply without
@@ -92,8 +110,22 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /api/v1/traditions", a.traditions)
 	a.mux.HandleFunc("GET /api/v1/traditions/{tradition}/regions", a.regions)
 	a.mux.HandleFunc("GET /api/v1/nakshatras", a.nakshatras)
+	a.mux.HandleFunc("GET /api/v1/naming-systems", a.namingSystems)
+	a.mux.HandleFunc("GET /api/v1/nakshatras/{naming}", a.nakshatrasIn)
 	a.mux.HandleFunc("GET /api/v1/trees", a.trees)
 	a.mux.HandleFunc("POST /api/v1/discoveries", a.discover)
+	// /api/v1/discovery is the AI-first pipeline: research, then recommend,
+	// with every claim attributed to a retrieved source. /api/v1/discoveries
+	// (plural) stays the reviewed-evidence lookup, and the two are deliberately
+	// not aliases of each other.
+	a.mux.HandleFunc("POST /api/v1/discovery", a.discoverAI)
+	a.mux.HandleFunc("GET /api/v1/discovery", a.listDiscoveries)
+	a.mux.HandleFunc("GET /api/v1/discovery/{id}", a.getDiscovery)
+	a.mux.HandleFunc("DELETE /api/v1/discovery/{id}", a.deleteDiscovery)
+	// A session is how a visitor keeps their own discoveries readable later
+	// without Everroot knowing who they are. It is optional: a discovery never
+	// requires an account.
+	a.mux.HandleFunc("POST /api/v1/session", a.createSession)
 	a.mux.HandleFunc("POST /api/v1/recommendations", a.recommend)
 	a.mux.HandleFunc("POST /api/v1/explain", a.explain)
 	a.mux.HandleFunc("POST /api/v1/questions", a.askQuestion)
@@ -275,85 +307,60 @@ func (a *API) reviewedCatalogueUnavailable(w http.ResponseWriter, r *http.Reques
 // errDatabaseNotConfigured is the reason logged when no pool exists at all.
 var errDatabaseNotConfigured = errors.New("DATABASE_URL is not configured")
 
+// traditions serves the supported-traditions list from local reference data.
+//
+// It used to read the `traditions` table and answer 503 whenever the database
+// was absent, which made choosing a tradition — an optional piece of context —
+// depend on a service the recommendation itself never needs. This list is
+// reference vocabulary rather than reviewed evidence, and is identical to what
+// migration 0004 seeds, so discovery now works against an empty, unseeded or
+// unreachable database.
 func (a *API) traditions(w http.ResponseWriter, r *http.Request) {
-	if a.db == nil {
-		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
-		return
-	}
-	rows, err := a.db.Query(r.Context(), `SELECT t.slug,t.display_name FROM traditions t JOIN cultures c ON c.id=t.culture_id WHERE t.status='active' AND c.status='active' ORDER BY t.display_name`)
-	if err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	defer rows.Close()
-	out := []map[string]string{}
-	for rows.Next() {
-		var slug, name string
-		if err := rows.Scan(&slug, &name); err != nil {
-			a.reviewedCatalogueUnavailable(w, r, err)
-			return
-		}
-		out = append(out, map[string]string{"slug": slug, "name": name})
-	}
-	if err := rows.Err(); err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	writeJSON(w, 200, out)
-}
-func (a *API) regions(w http.ResponseWriter, r *http.Request) {
-	if a.db == nil {
-		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
-		return
-	}
-	rows, err := a.db.Query(r.Context(), `SELECT tl.region_name FROM tradition_locales tl JOIN traditions t ON t.id=tl.tradition_id JOIN cultures c ON c.id=t.culture_id WHERE t.slug=$1 AND t.status='active' AND c.status='active' AND tl.status='active' ORDER BY tl.region_name`, r.PathValue("tradition"))
-	if err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	defer rows.Close()
-	regions := []string{}
-	for rows.Next() {
-		var region string
-		if err := rows.Scan(&region); err != nil {
-			a.reviewedCatalogueUnavailable(w, r, err)
-			return
-		}
-		regions = append(regions, region)
-	}
-	if err := rows.Err(); err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	writeJSON(w, 200, regions)
+	writeJSON(w, 200, traditionReference)
 }
 
+// regions serves the recorded regions for one tradition, from the same
+// reference data and for the same reason.
+//
+// An unrecognised tradition gets an empty list rather than an error. The field
+// this feeds only ever narrows a query, so a lookup that finds nothing must
+// not become a wall the visitor has to get past.
+func (a *API) regions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, regionsFor(r.PathValue("tradition")))
+}
+
+// nakshatras serves the canonical 27 from the local reference list.
+//
+// These names are a fixed input vocabulary. Reading them from the database
+// made a list of twenty-seven names contingent on a migration having run, and
+// asking the model to produce them would return a different set on every
+// request. Migration 0002 seeds exactly these, in exactly this order.
 func (a *API) nakshatras(w http.ResponseWriter, r *http.Request) {
-	if a.db == nil {
-		a.reviewedCatalogueUnavailable(w, r, errDatabaseNotConfigured)
-		return
-	}
-	rows, err := a.db.Query(r.Context(), `SELECT canonical_name,ordinal FROM nakshatras ORDER BY ordinal`)
-	if err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	defer rows.Close()
-	out := []map[string]any{}
-	for rows.Next() {
-		var name string
-		var ordinal int
-		if err := rows.Scan(&name, &ordinal); err != nil {
-			a.reviewedCatalogueUnavailable(w, r, err)
-			return
-		}
-		out = append(out, map[string]any{"name": name, "ordinal": ordinal})
-	}
-	if err := rows.Err(); err != nil {
-		a.reviewedCatalogueUnavailable(w, r, err)
-		return
-	}
-	writeJSON(w, 200, out)
+	writeJSON(w, 200, nakshatraReference)
+}
+
+// namingSystems serves the naming systems Everroot holds names for, so a
+// visitor can be asked which language they know a nakshatra by before being
+// shown a list of names.
+//
+// The alternative is to present one tradition's romanised spellings as though
+// they were everyone's, which is what the interface used to do. Each entry
+// names its own endonym so the choice can be recognised without reading an
+// English label.
+func (a *API) namingSystems(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, namingSystems())
+}
+
+// nakshatrasIn serves the twenty-seven as a chosen naming system names them.
+//
+// The sequence is the same in every naming system, so an unrecognised code
+// still returns all twenty-seven rather than an error: the only thing it
+// changes is how they are spelled. Callers compare the code against
+// /api/v1/naming-systems to learn whether the names they got are the ones that
+// were asked for, and say so when they are not.
+func (a *API) nakshatrasIn(w http.ResponseWriter, r *http.Request) {
+	names, _ := nakshatraNamesFor(r.PathValue("naming"))
+	writeJSON(w, 200, names)
 }
 
 type discoveryRequest struct {

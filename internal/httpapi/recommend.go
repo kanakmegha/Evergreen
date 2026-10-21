@@ -95,9 +95,13 @@ func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Intention = strings.TrimSpace(req.Intention)
-	label, supported := intentionLabels[req.Intention]
+	// A known intention key keeps its existing label. Anything else is the
+	// visitor's own words: a closed vocabulary here meant an unfamiliar
+	// question was refused with a 400 before a model ever saw it, which is
+	// the opposite of what discovery is for.
+	label, supported := resolveIntention(req.Intention)
 	if !supported {
-		writeError(w, 400, "unsupported intention")
+		writeError(w, 400, "an intention is required")
 		return
 	}
 	req.Answer = strings.TrimSpace(req.Answer)
